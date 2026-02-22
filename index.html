@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>지원사업 공고 뷰어</title>
+  <meta name="description" content="국내 테크노파크·소상공인 지원사업 공고를 한눈에 조회하는 서비스"/>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Pretendard:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+  <style>
+    /* ── Reset & Base ── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0d0f14;
+      --surface: #161b26;
+      --surface2: #1e2535;
+      --border: rgba(255,255,255,.07);
+      --accent: #6366f1;
+      --accent2: #818cf8;
+      --green: #22c55e;
+      --orange: #f59e0b;
+      --red: #ef4444;
+      --text: #e2e8f0;
+      --muted: #64748b;
+      --card-h: rgba(99,102,241,.08);
+      --radius: 14px;
+      --banner-h: 68px;
+    }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: 'Pretendard', 'Apple SD Gothic Neo', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    /* ── Fixed Banner ── */
+    #banner {
+      position: fixed; top: 0; left: 0; right: 0;
+      height: var(--banner-h);
+      background: rgba(13,15,20,.85);
+      backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center;
+      padding: 0 20px; gap: 10px;
+      z-index: 1000;
+      flex-wrap: nowrap;
+    }
+    #banner .logo {
+      font-size: 1rem; font-weight: 700; color: var(--accent2);
+      white-space: nowrap; margin-right: 12px; letter-spacing: -.3px;
+    }
+    #banner .sep { width: 1px; height: 28px; background: var(--border); flex-shrink: 0; }
+    .sort-btn {
+      padding: 6px 14px; border-radius: 20px; border: 1px solid var(--border);
+      background: var(--surface2); color: var(--text);
+      font-size: .8rem; font-weight: 500; cursor: pointer;
+      transition: all .18s; white-space: nowrap; flex-shrink: 0;
+    }
+    .sort-btn:hover { border-color: var(--accent); color: var(--accent2); background: rgba(99,102,241,.1); }
+    .sort-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+    #searchBox {
+      margin-left: auto;
+      padding: 6px 14px;
+      border-radius: 20px;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      font-size: .8rem;
+      width: 200px;
+      outline: none;
+    }
+    #searchBox:focus { border-color: var(--accent); }
+    #searchBox::placeholder { color: var(--muted); }
+    #countBadge {
+      font-size: .75rem; color: var(--muted); white-space: nowrap; padding-left: 8px;
+    }
+
+    /* ── Main Grid ── */
+    #main {
+      padding: calc(var(--banner-h) + 24px) 24px 48px;
+      max-width: 1600px; margin: 0 auto;
+    }
+    #grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+      gap: 18px;
+    }
+
+    /* ── Card ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      display: flex; flex-direction: column; gap: 12px;
+      transition: transform .18s, box-shadow .18s, border-color .18s;
+      position: relative; overflow: hidden;
+    }
+    .card::before {
+      content: ''; position: absolute;
+      top: 0; left: 0; right: 0; height: 3px;
+      border-radius: var(--radius) var(--radius) 0 0;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      opacity: 0; transition: opacity .18s;
+    }
+    .card:hover { transform: translateY(-3px); box-shadow: 0 12px 32px rgba(0,0,0,.4); border-color: rgba(99,102,241,.3); }
+    .card:hover::before { opacity: 1; }
+
+    .card-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+    .card-title {
+      font-size: .95rem; font-weight: 600; line-height: 1.4;
+      color: var(--text); flex: 1;
+    }
+    .copy-btn {
+      flex-shrink: 0;
+      width: 32px; height: 32px;
+      border-radius: 8px; border: 1px solid var(--border);
+      background: var(--surface2); color: var(--muted);
+      cursor: pointer; font-size: .85rem;
+      display: flex; align-items: center; justify-content: center;
+      transition: all .15s;
+    }
+    .copy-btn:hover { border-color: var(--accent); color: var(--accent2); background: rgba(99,102,241,.1); }
+    .copy-btn.copied { border-color: var(--green); color: var(--green); background: rgba(34,197,94,.1); }
+
+    .meta-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 3px 9px; border-radius: 12px; font-size: .73rem; font-weight: 500;
+    }
+    .badge-source { background: rgba(99,102,241,.15); color: var(--accent2); border: 1px solid rgba(99,102,241,.25); }
+    .badge-period { background: rgba(255,255,255,.05); color: var(--muted); border: 1px solid var(--border); font-size: .72rem; }
+    .badge-unlimited { background: rgba(245,158,11,.12); color: var(--orange); border: 1px solid rgba(245,158,11,.25); }
+    .badge-expired   { background: rgba(239,68,68,.1);  color: var(--red);    border: 1px solid rgba(239,68,68,.2); }
+    .badge-days { font-size: .68rem; padding: 2px 7px; border-radius: 10px; background: rgba(34,197,94,.1); color: var(--green); border: 1px solid rgba(34,197,94,.2); }
+
+    .overview {
+      font-size: .82rem; color: #94a3b8; line-height: 1.65;
+      display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical;
+      overflow: hidden; border-left: 2px solid rgba(99,102,241,.3); padding-left: 10px;
+    }
+    .overview.expanded { -webkit-line-clamp: unset; }
+    .toggle-btn {
+      font-size: .72rem; color: var(--accent2); background: none; border: none; cursor: pointer;
+      align-self: flex-start; padding: 0; margin-top: -6px;
+    }
+    .toggle-btn:hover { text-decoration: underline; }
+    .no-overview { font-size: .78rem; color: var(--muted); font-style: italic; }
+
+    .card-footer { display: flex; align-items: center; justify-content: space-between; margin-top: 4px; }
+    .link-btn {
+      display: inline-flex; align-items: center; gap: 5px;
+      font-size: .78rem; color: var(--accent2);
+      text-decoration: none; padding: 5px 11px;
+      border: 1px solid rgba(99,102,241,.3); border-radius: 8px;
+      transition: all .15s;
+    }
+    .link-btn:hover { background: rgba(99,102,241,.1); border-color: var(--accent); }
+
+    /* ── Loading / Empty ── */
+    #loading {
+      position: fixed; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 16px;
+      background: var(--bg); z-index: 2000;
+    }
+    .spinner {
+      width: 40px; height: 40px;
+      border: 3px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #emptyMsg { display: none; text-align: center; padding: 80px 20px; color: var(--muted); font-size: 1rem; }
+
+    /* ── Scrollbar ── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--surface2); border-radius: 3px; }
+
+    /* ── Responsive ── */
+    @media (max-width: 600px) {
+      #banner { padding: 0 12px; gap: 6px; overflow-x: auto; }
+      .sort-btn { font-size: .72rem; padding: 5px 10px; }
+      #searchBox { width: 130px; }
+      #grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- Loading -->
+<div id="loading">
+  <div class="spinner"></div>
+  <p style="color:var(--muted);font-size:.9rem">데이터 불러오는 중...</p>
+</div>
+
+<!-- Fixed Banner -->
+<div id="banner">
+  <span class="logo">📋 지원사업 뷰어</span>
+  <div class="sep"></div>
+
+  <button class="sort-btn active" data-sort="default"   id="btn-default">⭐ 추천순</button>
+  <button class="sort-btn"        data-sort="unlimited" id="btn-unlimited">💰 예산소진</button>
+  <button class="sort-btn"        data-sort="deadline-asc"  id="btn-asc">📅 마감 임박순</button>
+  <button class="sort-btn"        data-sort="deadline-desc" id="btn-desc">📅 마감 여유순</button>
+  <button class="sort-btn"        data-sort="has-overview"  id="btn-overview">📝 사업개요 있음</button>
+  <button class="sort-btn"        data-sort="source"        id="btn-source">🏢 출처별</button>
+
+  <div class="sep"></div>
+  <input id="searchBox" placeholder="🔍 검색…" type="text" autocomplete="off"/>
+  <span id="countBadge">0건</span>
+</div>
+
+<!-- Main -->
+<main id="main">
+  <div id="grid"></div>
+  <div id="emptyMsg">검색 결과가 없습니다.</div>
+</main>
+
+<script>
+// ── Globals ──────────────────────────────────────
+let allData = [];
+let currentSort = 'default';
+let currentQuery = '';
+const TODAY = new Date(); TODAY.setHours(0,0,0,0);
+
+// ── Helpers ──────────────────────────────────────
+function parseEndDate(period) {
+  if (!period) return null;
+  const clean = period.replace(/\n/g, ' ');
+  // Try all date patterns, collect all, return last (= end date)
+  const matches = [...clean.matchAll(/(\d{4})[-./](\d{1,2})[-./](\d{1,2})/g)];
+  if (!matches.length) return null;
+  const last = matches[matches.length - 1];
+  const d = new Date(+last[1], +last[2]-1, +last[3]);
+  return isNaN(d) ? null : d;
+}
+function daysLeft(period) {
+  const end = parseEndDate(period);
+  if (!end) return null;
+  return Math.round((end - TODAY) / 86400000);
+}
+function isUnlimited(period) {
+  return /예산\s*소진|소진\s*시/.test(period || '');
+}
+function hasOverview(item) {
+  return !!(item['사업개요'] || '').trim();
+}
+
+// ── Sort ─────────────────────────────────────────
+function sortData(arr, mode) {
+  const clone = [...arr];
+  if (mode === 'default') {
+    // 예산소진+개요 → 날짜남음+개요 → 나머지
+    clone.sort((a, b) => {
+      const ka = sortScore(a), kb = sortScore(b);
+      if (ka[0] !== kb[0]) return ka[0] - kb[0];
+      return ka[1] - kb[1];
+    });
+  } else if (mode === 'unlimited') {
+    clone.sort((a, b) => {
+      const au = isUnlimited(a['신청기간']), bu = isUnlimited(b['신청기간']);
+      if (au !== bu) return bu - au;
+      return sortScore(a)[1] - sortScore(b)[1];
+    });
+  } else if (mode === 'deadline-asc') {
+    clone.sort((a, b) => {
+      const da = daysLeft(a['신청기간']), db = daysLeft(b['신청기간']);
+      if (da === null && db === null) return 0;
+      if (da === null) return 1;
+      if (db === null) return -1;
+      return da - db;
+    });
+  } else if (mode === 'deadline-desc') {
+    clone.sort((a, b) => {
+      const da = daysLeft(a['신청기간']), db = daysLeft(b['신청기간']);
+      if (da === null && db === null) return 0;
+      if (da === null) return 1;
+      if (db === null) return -1;
+      return db - da;
+    });
+  } else if (mode === 'has-overview') {
+    clone.sort((a, b) => {
+      const ha = hasOverview(a), hb = hasOverview(b);
+      if (ha !== hb) return hb - ha;
+      return sortScore(a)[1] - sortScore(b)[1];
+    });
+  } else if (mode === 'source') {
+    clone.sort((a, b) => (a['출처'] || '').localeCompare(b['출처'] || '', 'ko'));
+  }
+  return clone;
+}
+
+function sortScore(item) {
+  const isU = isUnlimited(item['신청기간']);
+  const hasOv = hasOverview(item);
+  if (hasOv && isU) return [0, 0];
+  const dl = daysLeft(item['신청기간']);
+  if (hasOv && dl !== null && dl >= 0) return [1, -dl];
+  return [2, 0];
+}
+
+// ── Filter ───────────────────────────────────────
+function filterData(arr, q) {
+  if (!q) return arr;
+  const lower = q.toLowerCase();
+  return arr.filter(item =>
+    (item['지원사업명'] || '').toLowerCase().includes(lower) ||
+    (item['출처'] || '').toLowerCase().includes(lower) ||
+    (item['사업개요'] || '').toLowerCase().includes(lower)
+  );
+}
+
+// ── Render ───────────────────────────────────────
+function buildBadgePeriod(period) {
+  if (!period) return '<span class="badge badge-period">기간 없음</span>';
+  const clean = period.replace(/\n/g, ' ').trim();
+
+  if (isUnlimited(clean)) {
+    return `<span class="badge badge-unlimited">💰 예산 소진시까지</span>`;
+  }
+  const dl = daysLeft(clean);
+  let daysTag = '';
+  if (dl === null) {
+    daysTag = '';
+  } else if (dl < 0) {
+    daysTag = `<span class="badge badge-expired">마감</span>`;
+  } else if (dl === 0) {
+    daysTag = `<span class="badge badge-days" style="color:var(--orange);border-color:rgba(245,158,11,.3)">D-Day</span>`;
+  } else if (dl <= 7) {
+    daysTag = `<span class="badge badge-days" style="color:var(--orange);border-color:rgba(245,158,11,.3)">D-${dl}</span>`;
+  } else {
+    daysTag = `<span class="badge badge-days">D-${dl}</span>`;
+  }
+  return `<span class="badge badge-period">📅 ${clean}</span>${daysTag}`;
+}
+
+function cardHTML(item, idx) {
+  const name    = (item['지원사업명'] || '').replace(/\n/g, ' ').trim();
+  const source  = item['출처'] || '';
+  const period  = item['신청기간'] || '';
+  const link    = item['링크'] || '#';
+  const overview = (item['사업개요'] || '').trim();
+
+  const overviewHTML = overview
+    ? `<div class="overview" id="ov-${idx}">${overview.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br/>')}</div>
+       <button class="toggle-btn" onclick="toggleOv(${idx})">더보기 ▾</button>`
+    : `<p class="no-overview">사업개요 없음</p>`;
+
+  return `
+<div class="card" id="card-${idx}">
+  <div class="card-header">
+    <div class="card-title">${name}</div>
+    <button class="copy-btn" id="copy-${idx}" title="클립보드 복사" onclick="copyCard(${idx})">📋</button>
+  </div>
+  <div class="meta-row">
+    <span class="badge badge-source">🏢 ${source}</span>
+    ${buildBadgePeriod(period)}
+  </div>
+  ${overviewHTML}
+  <div class="card-footer">
+    <a class="link-btn" href="${link}" target="_blank" rel="noopener">공고 바로가기 ↗</a>
+  </div>
+</div>`;
+}
+
+function render() {
+  const filtered = filterData(allData, currentQuery);
+  const sorted   = sortData(filtered, currentSort);
+  const grid = document.getElementById('grid');
+  const empty = document.getElementById('emptyMsg');
+  document.getElementById('countBadge').textContent = `${sorted.length}건`;
+
+  if (!sorted.length) {
+    grid.innerHTML = '';
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+  // Render in chunks to avoid blocking
+  grid.innerHTML = '';
+  const CHUNK = 80;
+  let i = 0;
+  function renderChunk() {
+    const frag = document.createDocumentFragment();
+    const end = Math.min(i + CHUNK, sorted.length);
+    for (; i < end; i++) {
+      const div = document.createElement('div');
+      div.innerHTML = cardHTML(sorted[i], i);
+      frag.appendChild(div.firstElementChild);
+    }
+    grid.appendChild(frag);
+    if (i < sorted.length) requestAnimationFrame(renderChunk);
+  }
+  renderChunk();
+}
+
+// ── Interactions ─────────────────────────────────
+function toggleOv(idx) {
+  const el = document.getElementById(`ov-${idx}`);
+  const isExp = el.classList.toggle('expanded');
+  el.nextElementSibling.textContent = isExp ? '접기 ▴' : '더보기 ▾';
+}
+
+function copyCard(idx) {
+  const card = document.getElementById(`card-${idx}`);
+  const item = allData[idx] || {};
+  // find original item by index in rendered DOM matching
+  // simpler: collect text
+  const title  = card.querySelector('.card-title')?.textContent?.trim() || '';
+  const source = card.querySelector('.badge-source')?.textContent?.trim() || '';
+  const period = card.querySelector('.badge-period, .badge-unlimited')?.textContent?.trim() || '';
+  const overviewEl = card.querySelector('.overview');
+  const overview = overviewEl ? overviewEl.innerText.trim() : '사업개요 없음';
+  const link   = card.querySelector('.link-btn')?.href || '';
+
+  const text = `[${source}] ${title}\n신청기간: ${period}\n링크: ${link}\n\n${overview}`;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.getElementById(`copy-${idx}`);
+    btn.textContent = '✅';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = '📋'; btn.classList.remove('copied'); }, 1800);
+  }).catch(() => {
+    // fallback
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+  });
+}
+
+// ── Sort Buttons ─────────────────────────────────
+document.querySelectorAll('.sort-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.sort-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentSort = btn.dataset.sort;
+    render();
+  });
+});
+
+// ── Search ───────────────────────────────────────
+let searchTimer;
+document.getElementById('searchBox').addEventListener('input', e => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    currentQuery = e.target.value.trim();
+    render();
+  }, 280);
+});
+
+// ── Load Data ────────────────────────────────────
+fetch('./data.json')
+  .then(r => r.json())
+  .then(data => {
+    allData = data;
+    document.getElementById('loading').style.display = 'none';
+    render();
+  })
+  .catch(err => {
+    document.getElementById('loading').innerHTML =
+      `<p style="color:var(--red)">데이터 로드 실패: ${err.message}</p>`;
+  });
+</script>
+</body>
+</html>
