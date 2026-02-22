@@ -245,6 +245,50 @@
       opacity: 1;
     }
 
+    .card.checked {
+      background: rgba(34, 197, 94, .08);
+      border-color: rgba(34, 197, 94, .3);
+    }
+
+    .card.checked::before {
+      background: linear-gradient(90deg, var(--green), #4ade80);
+      opacity: 1;
+    }
+
+    .card-check {
+      flex-shrink: 0;
+      width: 20px;
+      height: 20px;
+      border-radius: 5px;
+      border: 1.5px solid var(--border);
+      background: var(--surface2);
+      cursor: pointer;
+      appearance: none;
+      -webkit-appearance: none;
+      position: relative;
+      transition: all .15s;
+    }
+
+    .card-check:hover {
+      border-color: var(--green);
+    }
+
+    .card-check:checked {
+      background: var(--green);
+      border-color: var(--green);
+    }
+
+    .card-check:checked::after {
+      content: '✓';
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: #fff;
+      font-size: .75rem;
+      font-weight: 700;
+    }
+
     .card-header {
       display: flex;
       align-items: flex-start;
@@ -522,6 +566,23 @@
     let currentSource = '';   // '' = 전체, 또는 출처명
     const TODAY = new Date(); TODAY.setHours(0, 0, 0, 0);
 
+    // ── 체크 상태 관리 (localStorage) ──────────────────
+    const CHECKED_KEY = 'biz_checked_links';
+    function getCheckedSet() {
+      try {
+        return new Set(JSON.parse(localStorage.getItem(CHECKED_KEY) || '[]'));
+      } catch { return new Set(); }
+    }
+    function saveCheckedSet(set) {
+      localStorage.setItem(CHECKED_KEY, JSON.stringify([...set]));
+    }
+    function toggleCheck(link) {
+      const set = getCheckedSet();
+      if (set.has(link)) { set.delete(link); } else { set.add(link); }
+      saveCheckedSet(set);
+      return set.has(link);
+    }
+
     // ── Helpers ──────────────────────────────────────
     function parseEndDate(period) {
       if (!period) return null;
@@ -658,9 +719,13 @@
        <button class="toggle-btn" onclick="toggleOv(${idx})">더보기 ▾</button>`
         : `<p class="no-overview">사업개요 없음</p>`;
 
+      const isChecked = getCheckedSet().has(link);
+
       return `
-<div class="card" id="card-${idx}">
+<div class="card${isChecked ? ' checked' : ''}" id="card-${idx}" data-link="${link.replace(/"/g, '&quot;')}">
   <div class="card-header">
+    <input type="checkbox" class="card-check" ${isChecked ? 'checked' : ''}
+           onchange="onCardCheck(${idx}, this)" title="확인 체크" />
     <div class="card-title">${name}</div>
     <button class="copy-btn" id="copy-${idx}" title="클립보드 복사" onclick="copyCard(${idx})">📋</button>
   </div>
@@ -706,6 +771,14 @@
     }
 
     // ── Interactions ─────────────────────────────────
+    function onCardCheck(idx, checkbox) {
+      const card = document.getElementById(`card-${idx}`);
+      const link = card?.dataset?.link || '';
+      if (!link) return;
+      const isNowChecked = toggleCheck(link);
+      card.classList.toggle('checked', isNowChecked);
+    }
+
     function toggleOv(idx) {
       const el = document.getElementById(`ov-${idx}`);
       const isExp = el.classList.toggle('expanded');
