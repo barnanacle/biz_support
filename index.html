@@ -542,7 +542,11 @@
       return /예산\s*소진|소진\s*시/.test(period || '');
     }
     function hasOverview(item) {
-      return !!(item['사업개요'] || '').trim();
+      const text = (item['사업개요'] || '').trim();
+      if (!text) return false;
+      // '내용 없음', '내용 없음 (사업목적 찾지 못함)', '크롤링 오류' 등은 없는 것으로 처리
+      if (/^내용\s*없음|^크롤링\s*오류/.test(text)) return false;
+      return true;
     }
 
     // ── Sort ─────────────────────────────────────────
@@ -580,11 +584,14 @@
           return db - da;
         });
       } else if (mode === 'has-overview') {
-        clone.sort((a, b) => {
-          const ha = hasOverview(a), hb = hasOverview(b);
-          if (ha !== hb) return hb - ha;
-          return sortScore(a)[1] - sortScore(b)[1];
-        });
+        // 사업개요가 실제로 있는 항목만 필터링 후 추천순 정렬
+        return clone
+          .filter(item => hasOverview(item))
+          .sort((a, b) => {
+            const ka = sortScore(a), kb = sortScore(b);
+            if (ka[0] !== kb[0]) return ka[0] - kb[0];
+            return ka[1] - kb[1];
+          });
       }
       return clone;
     }
