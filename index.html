@@ -807,26 +807,22 @@
 
     // ── Load Data ────────────────────────────────────
     fetch('./data.json')
-      .then(r => {
-        // Last-Modified 헤더 읽기
-        const lastMod = r.headers.get('Last-Modified');
-        if (lastMod) {
-          const d = new Date(lastMod);
-          const yyyy = d.getFullYear();
-          const mm = String(d.getMonth() + 1).padStart(2, '0');
-          const dd = String(d.getDate()).padStart(2, '0');
-          const hh = String(d.getHours()).padStart(2, '0');
-          const min = String(d.getMinutes()).padStart(2, '0');
-          document.getElementById('updateTime').textContent = `업데이트: ${yyyy}.${mm}.${dd} ${hh}:${min}`;
+      .then(r => r.json())
+      .then(payload => {
+        // data.json 구조: { "last_updated": "YYYY-MM-DD HH:MM:SS", "data": [...] }
+        const lastUpdated = payload.last_updated;
+        if (lastUpdated) {
+          // "2026-02-22 23:43:53" → "2026.02.22 23:43"
+          const formatted = lastUpdated.replace(/-/g, '.').slice(0, 16);
+          document.getElementById('updateTime').textContent = `업데이트: ${formatted}`;
         } else {
           document.getElementById('updateTime').textContent = `업데이트: 알 수 없음`;
         }
-        return r.json();
-      })
-      .then(data => {
-        allData = data;
+
+        // payload.data가 배열이면 새 구조, 아니면 이전(배열 직접) 구조 호환
+        allData = Array.isArray(payload) ? payload : (payload.data || []);
         document.getElementById('loading').style.display = 'none';
-        buildSourceDropdown(data);
+        buildSourceDropdown(allData);
         render();
       })
       .catch(err => {
