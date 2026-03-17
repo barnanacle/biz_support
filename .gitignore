@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# 크롤링 임시 파일
+crawler/biz_support_web/
+crawler/crawl_history.log
+crawler/unified_crawling_*.xlsx
+crawler/unified_crawling_*.json
+
+# OS
+.DS_Store

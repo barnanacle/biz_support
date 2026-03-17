@@ -1,0 +1,107 @@
+name: 크롤링 자동 실행
+
+on:
+  # 수동 트리거 (아이폰에서 실행 가능)
+  workflow_dispatch:
+    inputs:
+      pages:
+        description: '크롤링 페이지 수 (기본: 10)'
+        required: false
+        default: '10'
+
+  # 매일 오전 9시 (KST) = UTC 00:00 자동 실행
+  schedule:
+    - cron: '0 0 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 레포 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Chrome 설치
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: 'stable'
+
+      - name: ChromeDriver 설치
+        uses: nanasess/setup-chromedriver@v2
+
+      - name: Python 패키지 설치
+        run: |
+          pip install -r requirements.txt
+
+      - name: 크롤러 실행 환경 준비
+        run: |
+          # unified_crawler.py는 __file__ 기준으로 biz_support_web/ 디렉토리에 data.json을 씀
+          # crawler/unified_crawler.py 기준 → crawler/biz_support_web/ 에 쓰게 됨
+          mkdir -p crawler/biz_support_web
+          # 기존 data.json을 복사해둠 (크롤링 실패 시 원본 유지)
+          cp data.json crawler/biz_support_web/data.json || true
+
+      - name: 크롤링 실행
+        env:
+          DISPLAY: ':99'
+        run: |
+          # Xvfb 가상 디스플레이 (headless Chrome 안정성)
+          sudo Xvfb :99 -screen 0 1920x1080x24 &
+          sleep 2
+
+          # 크롤러 실행 (git push 부분은 자동으로 실패 → try/except로 처리됨)
+          cd crawler
+          python unified_crawler.py || echo "::warning::크롤링 중 일부 오류 발생 (부분 결과 사용)"
+
+      - name: 크롤링 결과 확인 및 반영
+        id: check
+        run: |
+          # 크롤링 결과가 있으면 레포 루트로 복사
+          if [ -f "crawler/biz_support_web/data.json" ]; then
+            NEW_SIZE=$(stat -c%s "crawler/biz_support_web/data.json" 2>/dev/null || stat -f%z "crawler/biz_support_web/data.json")
+            OLD_SIZE=$(stat -c%s "data.json" 2>/dev/null || stat -f%z "data.json" 2>/dev/null || echo "0")
+
+            echo "기존 data.json: ${OLD_SIZE} bytes"
+            echo "새로운 data.json: ${NEW_SIZE} bytes"
+
+            # 최소 크기 검증 (빈 결과 방지 - 최소 1KB)
+            if [ "$NEW_SIZE" -gt 1000 ]; then
+              cp crawler/biz_support_web/data.json data.json
+              echo "updated=true" >> "$GITHUB_OUTPUT"
+              echo "✅ data.json 업데이트 완료 (${NEW_SIZE} bytes)"
+            else
+              echo "⚠️ 크롤링 결과가 너무 작음 (${NEW_SIZE} bytes). 기존 데이터 유지."
+              echo "updated=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "❌ 크롤링 결과 파일 없음. 기존 데이터 유지."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 변경사항 커밋 및 푸시
+        if: steps.check.outputs.updated == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add data.json
+
+          # 변경사항이 있을 때만 커밋
+          if git diff --cached --quiet; then
+            echo "변경사항 없음. 커밋 생략."
+          else
+            TIMESTAMP=$(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M:%S')
+            git commit -m "auto: 크롤링 데이터 업데이트 (${TIMESTAMP})"
+            git push
+            echo "✅ 배포 완료! Cloudflare Pages 자동 빌드 시작됨."
+          fi
