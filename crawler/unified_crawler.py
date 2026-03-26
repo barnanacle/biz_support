@@ -1238,18 +1238,19 @@ def crawl_gdtp_list(end_page=5):
                     
                     title = title_tag.text.strip()
                     link = title_tag.get('href')
-                    
+
                     # 필터링: [ 진행중 ]
                     if "[ 진행중 ]" not in title:
                         continue
-                        
-                    # 날짜 (YY-MM-DD -> YYYY-MM-DD)
+
+                    # 링크에서 ?page= 파라미터 제거하여 중복 방지
+                    # /post/3176?page=1 → /post/3176
+                    link_clean = re.sub(r'\?page=\d+', '', link)
+
+                    # 날짜 (YY-MM-DD -> YYYY-MM-DD) — 목록의 등록일 (상세에서 공고기간으로 교체됨)
                     date_tag = row.select_one('div.bdate span')
                     date_text = ""
                     if date_tag:
-                        # 텍스트에서 아이콘 등 제외하고 날짜만 추출 시도
-                        # <i class="fa-solid fa-calendar-alt"></i> 25-12-01
-                        # get_text()로 가져오면 " 25-12-01" 형태일 것
                         raw_date = date_tag.get_text().strip()
                         if raw_date and raw_date.count('-') == 2:
                             parts = raw_date.split('-')
@@ -1257,16 +1258,17 @@ def crawl_gdtp_list(end_page=5):
                                 date_text = f"20{parts[0]}-{parts[1]}-{parts[2]}"
                             else:
                                 date_text = raw_date
-                    
-                    # 중복 제거 (링크 기준)
-                    if any(r['링크'] == link for r in results) or any(r['링크'] == link for r in page_results):
+
+                    # 중복 제거 (정규화된 링크 기준)
+                    if any(re.sub(r'\?page=\d+', '', r['링크']) == link_clean for r in results) or \
+                       any(re.sub(r'\?page=\d+', '', r['링크']) == link_clean for r in page_results):
                         continue
-                        
+
                     page_results.append({
                         '출처': '경기대진테크노파크',
                         '지원사업명': title,
-                        '신청기간': date_text, # 접수기간 대신 날짜 사용
-                        '링크': link,
+                        '신청기간': date_text, # 상세 크롤링에서 공고기간으로 교체됨
+                        '링크': link_clean,
                         '사업개요': '' # 상세에서 계속
                     })
                     
@@ -1284,19 +1286,33 @@ def crawl_gdtp_list(end_page=5):
 def crawl_gdtp_details(data_list):
     """
     경기대진테크노파크 상세 페이지 크롤링 (병렬)
-    대상: div#post-content
+    대상: div#post-content (사업개요), div.post-info (공고기간)
     """
     print(f"[경기대진테크노파크] {len(data_list)}개 상세 페이지 병렬 크롤링 시작...")
     _hdrs = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
 
     def _fetch(item):
         try:
-            r = GLOBAL_SESSION.get(item['\ub9c1\ud06c'], headers=_hdrs, timeout=10)
+            r = GLOBAL_SESSION.get(item['링크'], headers=_hdrs, timeout=10)
             soup = BeautifulSoup(r.text, 'html.parser')
+
+            # 사업개요 추출
             div = soup.find('div', id='post-content')
-            item['\uc0ac\uc5c5\uac1c\uc694'] = div.get_text(separator='\n', strip=True) if div else "\ub0b4\uc6a9 \uc5c6\uc74c"
+            item['사업개요'] = div.get_text(separator='\n', strip=True) if div else "내용 없음"
+
+            # 공고기간 추출 (li.list-group-item 내 라벨+값 쌍)
+            for li in soup.find_all('li', class_='list-group-item'):
+                label_div = li.find('div', class_='col-sm-2')
+                value_div = li.find('div', class_='list-group-item-text')
+                if label_div and value_div:
+                    label = label_div.get_text(strip=True)
+                    if '공고일' in label or '접수기간' in label or '신청기간' in label:
+                        period_text = value_div.get_text(strip=True)
+                        if period_text:
+                            item['신청기간'] = period_text
+                            break
         except Exception as e:
-            item['\uc0ac\uc5c5\uac1c\uc694'] = "\ud06c\ub864\ub9c1 \uc2e4\ud328"
+            item['사업개요'] = "크롤링 실패"
         return item
 
     with ThreadPoolExecutor(max_workers=8) as executor:
