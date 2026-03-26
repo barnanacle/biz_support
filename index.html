@@ -532,7 +532,7 @@
     <span class="logo">📋 지원사업 뷰어</span>
     <div class="sep"></div>
 
-    <button class="sort-btn active" data-sort="default" id="btn-default">⭐ 추천순</button>
+    <button class="sort-btn active" data-sort="default" id="btn-default">🕐 최신순</button>
     <button class="sort-btn" data-sort="deadline-asc" id="btn-asc">📅 마감 임박순</button>
     <button class="sort-btn" data-sort="deadline-desc" id="btn-desc">📅 마감 여유순</button>
     <button class="sort-btn" data-sort="has-overview" id="btn-overview">📝 사업개요 있음</button>
@@ -614,12 +614,8 @@
     function sortData(arr, mode) {
       const clone = [...arr];
       if (mode === 'default') {
-        // 예산소진+개요 → 날짜남음+개요 → 나머지
-        clone.sort((a, b) => {
-          const ka = sortScore(a), kb = sortScore(b);
-          if (ka[0] !== kb[0]) return ka[0] - kb[0];
-          return ka[1] - kb[1];
-        });
+        // 최신순: 출처별 최신 2개씩 뽑고, 사업개요 있는 것 우선
+        return getLatestPerSource(arr);
       } else if (mode === 'deadline-asc') {
         // 마감된 항목 제외 후 마감임박순 정렬
         return clone
@@ -645,25 +641,44 @@
           return db - da;
         });
       } else if (mode === 'has-overview') {
-        // 사업개요가 실제로 있는 항목만 필터링 후 추천순 정렬
+        // 사업개요가 실제로 있는 항목만 필터링 후 마감 임박순 정렬
         return clone
           .filter(item => hasOverview(item))
           .sort((a, b) => {
-            const ka = sortScore(a), kb = sortScore(b);
-            if (ka[0] !== kb[0]) return ka[0] - kb[0];
-            return ka[1] - kb[1];
+            const da = daysLeft(a['신청기간']), db = daysLeft(b['신청기간']);
+            if (da === null && db === null) return 0;
+            if (da === null) return 1;
+            if (db === null) return -1;
+            return da - db;
           });
       }
       return clone;
     }
 
-    function sortScore(item) {
-      const isU = isUnlimited(item['신청기간']);
-      const hasOv = hasOverview(item);
-      if (hasOv && isU) return [0, 0];
-      const dl = daysLeft(item['신청기간']);
-      if (hasOv && dl !== null && dl >= 0) return [1, -dl];
-      return [2, 0];
+    function getLatestPerSource(arr) {
+      // 출처별로 그룹화
+      const groups = {};
+      arr.forEach(item => {
+        const src = item['출처'] || '기타';
+        if (!groups[src]) groups[src] = [];
+        groups[src].push(item);
+      });
+
+      // 각 출처별 최신 2개 추출 (배열 앞쪽 = 최신으로 간주, 원본 순서 유지)
+      const picked = [];
+      Object.keys(groups).forEach(src => {
+        const items = groups[src];
+        picked.push(...items.slice(0, 2));
+      });
+
+      // 사업개요 있는 것 상단, 없는 것 하단
+      picked.sort((a, b) => {
+        const aHas = hasOverview(a) ? 0 : 1;
+        const bHas = hasOverview(b) ? 0 : 1;
+        return aHas - bHas;
+      });
+
+      return picked;
     }
 
     // ── Filter ───────────────────────────────────────
