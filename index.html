@@ -611,6 +611,21 @@
       return true;
     }
 
+    // ── Daily Shuffle (동일 우선순위 카드 매일 순서 변경) ──
+    function dailySeed() {
+      const t = new Date();
+      return t.getFullYear() * 10000 + (t.getMonth() + 1) * 100 + t.getDate();
+    }
+    function hashStr(s, seed) {
+      let h = seed;
+      for (let i = 0; i < s.length; i++) {
+        h = ((h << 5) - h) + s.charCodeAt(i);
+        h |= 0;
+      }
+      return h;
+    }
+    const DAILY_SEED = dailySeed();
+
     // ── Sort ─────────────────────────────────────────
     function sortData(arr, mode) {
       const clone = [...arr];
@@ -675,20 +690,26 @@
       });
 
       // 각 출처별 신청기간 시작일 기준 최신순 정렬 후 2개 추출
+      // 같은 시작일 카드는 매일 다른 순서로 뽑히도록 daily seed 적용
       const picked = [];
       Object.keys(groups).forEach(src => {
         const items = groups[src].slice().sort((a, b) => {
           const da = parseStartDate(a['신청기간']);
           const db = parseStartDate(b['신청기간']);
-          if (!da && !db) return 0;
-          if (!da) return 1;
-          if (!db) return -1;
-          return db - da; // 최신(날짜 큰 것) 먼저
+          const ta = da ? da.getTime() : 0;
+          const tb = db ? db.getTime() : 0;
+          if (ta !== tb) {
+            if (!da) return 1;
+            if (!db) return -1;
+            return tb - ta;
+          }
+          return hashStr(a['지원사업명'] || '', DAILY_SEED) - hashStr(b['지원사업명'] || '', DAILY_SEED);
         });
         picked.push(...items.slice(0, 2));
       });
 
       // 사업개요 있는 것 상단, 없는 것 하단
+      // 동일 우선순위 내에서는 매일 순서가 바뀌도록 daily seed 기반 tiebreaker 적용
       picked.sort((a, b) => {
         const aHas = hasOverview(a) ? 0 : 1;
         const bHas = hasOverview(b) ? 0 : 1;
@@ -696,10 +717,17 @@
         // 같은 그룹 내에서는 시작일 최신순
         const da = parseStartDate(a['신청기간']);
         const db = parseStartDate(b['신청기간']);
-        if (!da && !db) return 0;
-        if (!da) return 1;
-        if (!db) return -1;
-        return db - da;
+        const ta = da ? da.getTime() : 0;
+        const tb = db ? db.getTime() : 0;
+        if (ta !== tb) {
+          if (!da) return 1;
+          if (!db) return -1;
+          return tb - ta;
+        }
+        // 같은 날짜/같은 우선순위 → 매일 바뀌는 해시로 셔플
+        const ha = hashStr(a['지원사업명'] || '', DAILY_SEED);
+        const hb = hashStr(b['지원사업명'] || '', DAILY_SEED);
+        return ha - hb;
       });
 
       return picked;
