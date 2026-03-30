@@ -9,9 +9,9 @@ on:
         required: false
         default: '10'
 
-  # 매일 오전 9시 (KST) = UTC 00:00 자동 실행
+  # 매일 저녁 9시 (KST) = UTC 12:00 자동 실행
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 12 * * *'
 
 permissions:
   contents: write
