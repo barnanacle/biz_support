@@ -696,15 +696,11 @@
       if (pa.bucket !== pb.bucket) return pb.bucket - pa.bucket;
       // 5) 남은 일수 많은 순
       if (pa.days !== pb.days) return pb.days - pa.days;
-      // 6) 동일 우선순위 내에서는 daily seed 기반 셔플 (갱신감)
-      return hashStr(a['지원사업명'] || '', DAILY_SEED) - hashStr(b['지원사업명'] || '', DAILY_SEED);
+      // 6) 동일 우선순위 내에서는 세션 시드 기반 셔플 (새로고침마다 순서 변경)
+      return hashStr(a['지원사업명'] || '', SHUFFLE_SEED) - hashStr(b['지원사업명'] || '', SHUFFLE_SEED);
     }
 
-    // ── Daily Shuffle (동일 우선순위 카드 매일 순서 변경) ──
-    function dailySeed() {
-      const t = new Date();
-      return t.getFullYear() * 10000 + (t.getMonth() + 1) * 100 + t.getDate();
-    }
+    // ── Shuffle Seed (새로고침마다 재생성 → 매 세션 상단 로테이션) ──
     function hashStr(s, seed) {
       let h = seed;
       for (let i = 0; i < s.length; i++) {
@@ -713,7 +709,9 @@
       }
       return h;
     }
-    const DAILY_SEED = dailySeed();
+    // 페이지 로드 시 한 번만 생성. 렌더 중에는 일정하게 유지되지만
+    // 사용자가 새로고침할 때마다 새로운 값이 되어 상단 카드 순서가 바뀐다.
+    const SHUFFLE_SEED = (Math.random() * 0x7fffffff) | 0;
 
     // ── Sort ─────────────────────────────────────────
     function sortData(arr, mode) {
@@ -785,14 +783,14 @@
     }
 
     /**
-     * 추천 정렬 + 매일 갱신감 보장
+     * 추천 정렬 + 새로고침 로테이션
      *   1) 오늘 first_seen + 요건 충족 = '신규 우수 카드' → 최상단 pin
-     *   2) 그 다음 상위 SHUFFLE_SIZE개는 daily seed 해시로 셔플
-     *      (스코어 tier가 같은 우수 카드들 순서를 매일 바꿈 → 상단 카드 로테이션)
+     *   2) 그 다음 상위 SHUFFLE_SIZE개는 세션 시드 해시로 셔플
+     *      (새로고침마다 SHUFFLE_SEED 재생성 → 매번 상단 카드 순서 변경)
      *   3) 이후는 추천 스코어 순으로 유지
      *   4) 만료된 카드는 항상 최하단
      */
-    const SHUFFLE_SIZE = 40;  // 상위 몇 개를 매일 셔플할지 (30~50 범위)
+    const SHUFFLE_SIZE = 40;  // 상위 몇 개를 셔플할지 (30~50 범위)
 
     function getRecommended(arr) {
       // 0단계: 만료 카드 분리
@@ -817,17 +815,17 @@
       // 신규 pin도 추천 스코어 순 유지
       freshPinned.sort(compareRecommend);
 
-      // 3단계: rest의 상위 SHUFFLE_SIZE개를 daily seed 셔플
+      // 3단계: rest의 상위 SHUFFLE_SIZE개를 세션 시드 셔플
       //         (신규가 많으면 셔플 영역은 그만큼 줄여 상단이 과밀해지는 것 방지)
       const shuffleSize = Math.max(20, SHUFFLE_SIZE - freshPinned.length);
       const shuffleable = rest.slice(0, shuffleSize);
       const tail = rest.slice(shuffleSize);
 
-      // daily seed 기반 해시 정렬 (안정적, 하루 내 동일, 날짜 바뀌면 순서 변경)
+      // 세션 시드 기반 해시 정렬 (렌더 중에는 안정, 새로고침 시마다 재배치)
       shuffleable.sort((a, b) => {
         const ka = a['링크'] || a['지원사업명'] || '';
         const kb = b['링크'] || b['지원사업명'] || '';
-        return hashStr(ka, DAILY_SEED) - hashStr(kb, DAILY_SEED);
+        return hashStr(ka, SHUFFLE_SEED) - hashStr(kb, SHUFFLE_SEED);
       });
 
       return [...freshPinned, ...shuffleable, ...tail, ...expired];
