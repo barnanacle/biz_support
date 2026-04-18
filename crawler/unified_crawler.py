@@ -4,7 +4,7 @@ import base64
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from bs4 import BeautifulSoup
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import pyperclip
 import re
@@ -442,7 +442,13 @@ def _sort_key(item):
     )
 
 def save_to_web_json(data):
-    """크롤링 결과를 웹 뷰어용 data.json에만 저장"""
+    """크롤링 결과를 웹 뷰어용 data.json에만 저장.
+
+    - 각 카드에 `first_seen` 필드를 태깅하여 '신규 카드' 식별 가능하게 함.
+    - 기존 data.json에 있던 링크는 기존 first_seen 값을 그대로 보존.
+    - 첫 실행(기존 data.json 없음) 시 모든 카드가 신규로 잡히는 것을 방지하기
+      위해 전체를 어제 날짜로 태깅.
+    """
     if not data:
         print("저장할 데이터가 없습니다.")
         return 0
@@ -459,11 +465,42 @@ def save_to_web_json(data):
         print(f"[중복 제거] {len(data)}개 → {len(deduped)}개 (중복 {len(data) - len(deduped)}개 제거)")
     data = deduped
 
+    # ── first_seen 태깅 ──────────────────────────────────
+    web_data_path = os.path.join(os.path.dirname(__file__), 'biz_support_web', 'data.json')
+    existing_first_seen = {}
+    had_previous = False
+    try:
+        with open(web_data_path, 'r', encoding='utf-8') as f:
+            existing = json.load(f)
+            for it in existing.get('data', []):
+                link = it.get('링크')
+                fs = it.get('first_seen')
+                if link and fs:
+                    existing_first_seen[link] = fs
+            had_previous = bool(existing.get('data'))
+    except (FileNotFoundError, json.JSONDecodeError):
+        had_previous = False
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    # 첫 실행에서는 모든 카드를 "이미 존재하던 것"으로 취급 (어제 날짜 태깅)
+    fallback_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    new_count = 0
+    for item in data:
+        link = item.get('링크', '')
+        if link in existing_first_seen:
+            item['first_seen'] = existing_first_seen[link]
+        elif had_previous:
+            item['first_seen'] = today_str
+            new_count += 1
+        else:
+            item['first_seen'] = fallback_str
+    print(f"[first_seen] 신규 {new_count}개 / 기존 {len(data) - new_count}개")
+
     # 정렬 적용
     sorted_data = sorted(data, key=_sort_key)
 
     # 웹 뷰어 데이터 덮어쓰기 (last_updated 메타데이터 포함)
-    web_data_path = os.path.join(os.path.dirname(__file__), 'biz_support_web', 'data.json')
     try:
         web_payload = {
             "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -471,7 +508,7 @@ def save_to_web_json(data):
         }
         with open(web_data_path, 'w', encoding='utf-8') as f:
             json.dump(web_payload, f, ensure_ascii=False, indent=2)
-        print(f"웹 뷰어용 '{web_data_path}' 파일을 성공적으로 갱신했습니다. (last_updated 포함)")
+        print(f"웹 뷰어용 '{web_data_path}' 파일을 성공적으로 갱신했습니다. (last_updated + first_seen 포함)")
     except Exception as e:
         print(f"[오류] 웹 뷰어 데이터 갱신 실패: {e}")
 

@@ -396,6 +396,14 @@
       border: 1px solid rgba(99, 102, 241, .25);
     }
 
+    .badge-new {
+      background: linear-gradient(135deg, rgba(34, 197, 94, .2), rgba(99, 102, 241, .2));
+      color: #4ade80;
+      border: 1px solid rgba(34, 197, 94, .4);
+      font-weight: 700;
+      letter-spacing: .3px;
+    }
+
     .overview {
       font-size: .82rem;
       color: #94a3b8;
@@ -752,30 +760,77 @@
       return clone;
     }
 
+    // ── 오늘 날짜 (first_seen 비교용) ─────────────────
+    function todayYmd() {
+      const t = new Date();
+      const mm = String(t.getMonth() + 1).padStart(2, '0');
+      const dd = String(t.getDate()).padStart(2, '0');
+      return `${t.getFullYear()}-${mm}-${dd}`;
+    }
+    const TODAY_STR = todayYmd();
+
+    function isFresh(item) {
+      return item.first_seen === TODAY_STR;
+    }
+
+    // 추천 요건 충족 여부 (신규 카드 pin 판단용)
+    function meetsTopCriteria(item) {
+      const p = periodInfo(item['신청기간']);
+      if (p.expired) return false;
+      // 직접지원 or 상세 개요 or 충분한 기간
+      if (directSupportScore(item['지원사업명']) >= 1) return true;
+      if (overviewQuality(item) >= 1) return true;
+      if (p.bucket >= 2) return true;
+      return false;
+    }
+
+    /**
+     * 추천 정렬 + 매일 갱신감 보장
+     *   1) 오늘 first_seen + 요건 충족 = '신규 우수 카드' → 최상단 pin
+     *   2) 그 다음 상위 SHUFFLE_SIZE개는 daily seed 해시로 셔플
+     *      (스코어 tier가 같은 우수 카드들 순서를 매일 바꿈 → 상단 카드 로테이션)
+     *   3) 이후는 추천 스코어 순으로 유지
+     *   4) 만료된 카드는 항상 최하단
+     */
+    const SHUFFLE_SIZE = 40;  // 상위 몇 개를 매일 셔플할지 (30~50 범위)
+
     function getRecommended(arr) {
-      // 1단계: 출처별 상위 3개를 추천 스코어로 뽑아 다양성 유지
-      //         (특정 출처가 상단을 독식하지 않도록 방어)
-      const groups = {};
-      arr.forEach(item => {
-        const src = item['출처'] || '기타';
-        if (!groups[src]) groups[src] = [];
-        groups[src].push(item);
+      // 0단계: 만료 카드 분리
+      const alive = [];
+      const expired = [];
+      arr.forEach(it => {
+        if (periodInfo(it['신청기간']).expired) expired.push(it);
+        else alive.push(it);
       });
+      expired.sort(compareRecommend);
 
-      const PER_SOURCE = 3;
-      const topPicks = [];
+      // 1단계: alive를 추천 스코어로 정렬
+      alive.sort(compareRecommend);
+
+      // 2단계: 신규 & 요건 충족 카드 → 최상단 pin
+      const freshPinned = [];
       const rest = [];
-      Object.keys(groups).forEach(src => {
-        const sorted = groups[src].slice().sort(compareRecommend);
-        topPicks.push(...sorted.slice(0, PER_SOURCE));
-        rest.push(...sorted.slice(PER_SOURCE));
+      alive.forEach(it => {
+        if (isFresh(it) && meetsTopCriteria(it)) freshPinned.push(it);
+        else rest.push(it);
+      });
+      // 신규 pin도 추천 스코어 순 유지
+      freshPinned.sort(compareRecommend);
+
+      // 3단계: rest의 상위 SHUFFLE_SIZE개를 daily seed 셔플
+      //         (신규가 많으면 셔플 영역은 그만큼 줄여 상단이 과밀해지는 것 방지)
+      const shuffleSize = Math.max(20, SHUFFLE_SIZE - freshPinned.length);
+      const shuffleable = rest.slice(0, shuffleSize);
+      const tail = rest.slice(shuffleSize);
+
+      // daily seed 기반 해시 정렬 (안정적, 하루 내 동일, 날짜 바뀌면 순서 변경)
+      shuffleable.sort((a, b) => {
+        const ka = a['링크'] || a['지원사업명'] || '';
+        const kb = b['링크'] || b['지원사업명'] || '';
+        return hashStr(ka, DAILY_SEED) - hashStr(kb, DAILY_SEED);
       });
 
-      // 2단계: 각각을 추천 스코어 기준 전역 정렬 후, topPicks → rest 순으로 이어 붙임
-      //         (상단=다양한 출처의 최고 카드, 하단=남은 카드들)
-      topPicks.sort(compareRecommend);
-      rest.sort(compareRecommend);
-      return topPicks.concat(rest);
+      return [...freshPinned, ...shuffleable, ...tail, ...expired];
     }
 
     // ── Filter ───────────────────────────────────────
@@ -842,6 +897,11 @@
         supportBadge = `<span class="badge badge-support-mid" title="R&D·컨설팅·판로 등 간접 혜택">🛠️ 프로그램</span>`;
       }
 
+      // 신규(오늘 처음 발견) 뱃지
+      const newBadge = isFresh(item)
+        ? `<span class="badge badge-new" title="오늘 크롤링에서 새로 발견된 카드">🆕 신규</span>`
+        : '';
+
       return `
 <div class="card${isChecked ? ' checked' : ''}" id="card-${idx}" data-link="${link.replace(/"/g, '&quot;')}">
   <div class="card-header">
@@ -852,6 +912,7 @@
   </div>
   <div class="meta-row">
     <span class="badge badge-source">🏢 ${source}</span>
+    ${newBadge}
     ${supportBadge}
     ${buildBadgePeriod(period)}
   </div>
