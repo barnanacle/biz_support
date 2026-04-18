@@ -6,10 +6,7 @@ from bs4 import BeautifulSoup
 import time
 from datetime import datetime
 import json
-try:
-    import pyperclip
-except ImportError:
-    pyperclip = None
+import pyperclip
 import re
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -342,39 +339,107 @@ def write_crawl_log(total_count, source_counts):
 
     print(f"로그 기록 완료: {LOG_FILE}")
 
+# ── 추천 정렬용 키워드/패턴 ─────────────────────────────
+# 지원사업명만으로 '기업에게 직접적 지원(금전·재정·바우처 등)'이 드러나는 단어
+DIRECT_SUPPORT_KEYWORDS_HIGH = (
+    '자금', '융자', '대출', '이차보전', '보조금', '지원금', '출연금',
+    '기술료', '바우처', '사업화자금', '정책자금', '장려금', '금융지원',
+    '현금지원', '환급', '세제지원', '세액공제', '투자유치', '보증',
+)
+# 직접 금전 지원은 아니지만 실질적 기업 혜택이 있는 프로그램
+DIRECT_SUPPORT_KEYWORDS_MID = (
+    'R&D', '연구개발', '컨설팅', '멘토링', '인큐베이팅', '액셀러레이팅',
+    '시설지원', '장비', '공간지원', '판로', '마케팅', '해외진출',
+    '수출', '특허', '지재권', '시제품', '시작품', '스케일업',
+)
+BAD_OVERVIEW_PATTERNS = ('내용 없음', '크롤링 오류', '내용 추출 실패', '링크 오류')
+UNLIMITED_PATTERNS = ('예산 소진', '소진시까지', '소진 시까지', '예산소진')
+
+
+def _direct_support_score(name: str) -> int:
+    """지원사업명으로 추정한 직접 지원 정도. 2=재정/바우처, 1=간접혜택, 0=불명"""
+    if not name:
+        return 0
+    for kw in DIRECT_SUPPORT_KEYWORDS_HIGH:
+        if kw in name:
+            return 2
+    for kw in DIRECT_SUPPORT_KEYWORDS_MID:
+        if kw in name:
+            return 1
+    return 0
+
+
+def _overview_quality(overview: str) -> int:
+    """사업개요 상세도. 2=상세(≥200자), 1=간단(≥80자), 0=없음/비정상"""
+    clean = (overview or '').replace('\u200b', '').strip()
+    if not clean:
+        return 0
+    head = clean[:40]
+    if any(bad in head for bad in BAD_OVERVIEW_PATTERNS):
+        return 0
+    length = len(clean)
+    if length >= 200:
+        return 2
+    if length >= 80:
+        return 1
+    return 0
+
+
+def _period_score(period: str, today=None):
+    """신청기간 여유 평가.
+    반환: (bucket, days_left, is_expired)
+      bucket: 4=예산소진 · 3=30일↑ · 2=14일↑ · 1=7일↑ · 0=0일↑ · -1=마감/미상
+    """
+    period = (period or '').replace('\n', ' ').strip()
+    if not period:
+        return (-1, -9999, False)
+    if any(k in period for k in UNLIMITED_PATTERNS):
+        return (4, 9999, False)
+    today = today or datetime.now().date()
+    dates = re.findall(r'(\d{4})[-./](\d{1,2})[-./](\d{1,2})', period)
+    if not dates:
+        return (-1, -9999, False)
+    y, m, d = dates[-1]
+    try:
+        end_date = datetime(int(y), int(m), int(d)).date()
+    except ValueError:
+        return (-1, -9999, False)
+    days = (end_date - today).days
+    if days < 0:
+        return (-1, days, True)
+    if days >= 30:
+        return (3, days, False)
+    if days >= 14:
+        return (2, days, False)
+    if days >= 7:
+        return (1, days, False)
+    return (0, days, False)
+
+
 def _sort_key(item):
     """
-    정렬 기준 (우선순위 낮을수록 앞):
-      0: 사업개요 있음 + 예산소진시까지  → 최상단
-      1: 사업개요 있음 + 종료일 남음 (남은 일수 내림차순)
-      2: 그 외 (사업개요 없음 / 종료일 지남 등)
-    반환: (priority, -days_remaining)  → sort ascending
+    추천 정렬 기준 (ascending 정렬 → 스코어 음수화):
+      0) 마감된 항목은 무조건 하단
+      1) 지원사업명에 '직접 지원(자금·보조금·바우처 등)' 포함 여부
+      2) 사업개요 상세도 (길이 기반)
+      3) 신청기간 여유 버킷 (예산소진 > 30일↑ > 14일↑ > 7일↑)
+      4) 실제 남은 일수 (동일 버킷 내에서 여유 많은 카드 우선)
     """
-    overview = (item.get('사업개요') or '').strip()
-    period   = (item.get('신청기간') or '').strip().replace('\n', ' ')
-    today    = datetime.now().date()
+    name     = (item.get('지원사업명') or '').strip()
+    overview = item.get('사업개요') or ''
+    period   = item.get('신청기간') or ''
 
-    has_overview = bool(overview)
+    support_score  = _direct_support_score(name)
+    overview_score = _overview_quality(overview)
+    bucket, days_left, is_expired = _period_score(period)
 
-    # '예산 소진시까지' 판단 (유사 표현 포함)
-    is_unlimited = any(kw in period for kw in ['예산 소진', '소진시까지', '소진 시까지', '예산소진'])
-
-    if has_overview and is_unlimited:
-        return (0, 0)  # 최상단 그룹, 날짜 무관
-
-    # 종료일 파싱: 'YYYY-MM-DD' 패턴 중 마지막 날짜를 종료일로 사용
-    dates = re.findall(r'(\d{4})[-./](\d{1,2})[-./](\d{1,2})', period)
-    if dates and has_overview:
-        y, m, d = dates[-1]
-        try:
-            end_date = datetime(int(y), int(m), int(d)).date()
-            days_left = (end_date - today).days
-            if days_left >= 0:
-                return (1, -days_left)  # 남은 일수 많을수록 앞
-        except ValueError:
-            pass
-
-    return (2, 0)  # 나머지
+    return (
+        1 if is_expired else 0,   # 마감 → 하단
+        -support_score,           # 직접 지원 강도
+        -overview_score,          # 사업개요 상세도
+        -bucket,                  # 신청기간 여유 버킷
+        -days_left,               # 남은 일수
+    )
 
 def save_to_web_json(data):
     """크롤링 결과를 웹 뷰어용 data.json에만 저장"""
@@ -1286,7 +1351,7 @@ def crawl_gdtp_list(end_page=5):
 def crawl_gdtp_details(data_list):
     """
     경기대진테크노파크 상세 페이지 크롤링 (병렬)
-    대상: div#post-content (사업개요), div.post-info (공고기간)
+    대상: div#post-content (사업개요), li.list-group-item (공고기간)
     """
     print(f"[경기대진테크노파크] {len(data_list)}개 상세 페이지 병렬 크롤링 시작...")
     _hdrs = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
