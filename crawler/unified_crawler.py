@@ -6,7 +6,6 @@ from bs4 import BeautifulSoup
 import time
 from datetime import datetime, timedelta
 import json
-import pyperclip
 import re
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options

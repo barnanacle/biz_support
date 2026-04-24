@@ -48,8 +48,10 @@ jobs:
           # unified_crawler.py는 __file__ 기준으로 biz_support_web/ 디렉토리에 data.json을 씀
           # crawler/unified_crawler.py 기준 → crawler/biz_support_web/ 에 쓰게 됨
           mkdir -p crawler/biz_support_web
-          # 기존 data.json을 복사해둠 (크롤링 실패 시 원본 유지)
-          cp data.json crawler/biz_support_web/data.json || true
+          # save_to_web_json()이 first_seen 보존을 위해 기존 data.json을 읽으므로 미리 복사.
+          # 크롤러가 정상 종료해도 last_updated가 갱신되지 않은 경우는
+          # 아래 '결과 확인' 단계에서 잡아낸다.
+          cp data.json crawler/biz_support_web/data.json
 
       - name: 크롤링 실행
         env:
@@ -59,34 +61,54 @@ jobs:
           sudo Xvfb :99 -screen 0 1920x1080x24 &
           sleep 2
 
-          # 크롤러 실행 (git push 부분은 자동으로 실패 → try/except로 처리됨)
+          # 크롤러 실행. 스크립트 끝의 git push는 CI 환경에서 실패하지만 그 부분은
+          # 크롤러 내부에서 try/except로 처리되어 exit 0 으로 끝난다.
+          # ImportError 등으로 즉시 죽는 경우는 전체 워크플로우를 실패시켜야 하므로
+          # `|| true` 로 모든 오류를 삼키지 않는다.
           cd crawler
-          python unified_crawler.py || echo "::warning::크롤링 중 일부 오류 발생 (부분 결과 사용)"
+          set -o pipefail
+          python -u unified_crawler.py 2>&1 | tee crawl.log
+          CRAWLER_EXIT=${PIPESTATUS[0]}
+          if [ "$CRAWLER_EXIT" -ne 0 ]; then
+            echo "::error::크롤러가 비정상 종료됨 (exit=$CRAWLER_EXIT). 로그 확인 필요."
+            exit "$CRAWLER_EXIT"
+          fi
 
       - name: 크롤링 결과 확인 및 반영
         id: check
         run: |
-          # 크롤링 결과가 있으면 레포 루트로 복사
-          if [ -f "crawler/biz_support_web/data.json" ]; then
-            NEW_SIZE=$(stat -c%s "crawler/biz_support_web/data.json" 2>/dev/null || stat -f%z "crawler/biz_support_web/data.json")
-            OLD_SIZE=$(stat -c%s "data.json" 2>/dev/null || stat -f%z "data.json" 2>/dev/null || echo "0")
-
-            echo "기존 data.json: ${OLD_SIZE} bytes"
-            echo "새로운 data.json: ${NEW_SIZE} bytes"
-
-            # 최소 크기 검증 (빈 결과 방지 - 최소 1KB)
-            if [ "$NEW_SIZE" -gt 1000 ]; then
-              cp crawler/biz_support_web/data.json data.json
-              echo "updated=true" >> "$GITHUB_OUTPUT"
-              echo "✅ data.json 업데이트 완료 (${NEW_SIZE} bytes)"
-            else
-              echo "⚠️ 크롤링 결과가 너무 작음 (${NEW_SIZE} bytes). 기존 데이터 유지."
-              echo "updated=false" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "❌ 크롤링 결과 파일 없음. 기존 데이터 유지."
-            echo "updated=false" >> "$GITHUB_OUTPUT"
+          NEW_PATH="crawler/biz_support_web/data.json"
+          if [ ! -f "$NEW_PATH" ]; then
+            echo "::error::크롤링 결과 파일 없음: $NEW_PATH"
+            exit 1
           fi
+
+          NEW_SIZE=$(stat -c%s "$NEW_PATH" 2>/dev/null || stat -f%z "$NEW_PATH")
+          OLD_SIZE=$(stat -c%s "data.json" 2>/dev/null || stat -f%z "data.json" 2>/dev/null || echo "0")
+
+          # last_updated 메타데이터가 이전 본과 동일하면 = 크롤러가 결과를 못 썼다는 뜻.
+          # (예: ImportError로 즉시 죽은 경우, 사전 복사한 prev 파일이 그대로 남는다.)
+          OLD_LAST_UPDATED=$(python3 -c "import json; print(json.load(open('data.json','r',encoding='utf-8')).get('last_updated','') or '')")
+          NEW_LAST_UPDATED=$(python3 -c "import json; print(json.load(open('$NEW_PATH','r',encoding='utf-8')).get('last_updated','') or '')")
+
+          echo "기존 data.json:    ${OLD_SIZE} bytes / last_updated='${OLD_LAST_UPDATED}'"
+          echo "새로운 data.json:  ${NEW_SIZE} bytes / last_updated='${NEW_LAST_UPDATED}'"
+
+          if [ "$NEW_SIZE" -le 1000 ]; then
+            echo "::error::크롤링 결과가 너무 작음 (${NEW_SIZE} bytes). 기존 데이터 유지."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          if [ -z "$NEW_LAST_UPDATED" ] || [ "$NEW_LAST_UPDATED" = "$OLD_LAST_UPDATED" ]; then
+            echo "::error::last_updated 메타데이터가 갱신되지 않음. 크롤러가 결과를 쓰지 못한 것으로 판단."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          cp "$NEW_PATH" data.json
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+          echo "✅ data.json 업데이트 완료 (${NEW_SIZE} bytes, last_updated=${NEW_LAST_UPDATED})"
 
       - name: 변경사항 커밋 및 푸시
         if: steps.check.outputs.updated == 'true'
