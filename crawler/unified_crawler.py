@@ -7,6 +7,12 @@ import time
 from datetime import datetime, timedelta
 import json
 import re
+import io
+import zipfile
+import zlib
+import struct
+from urllib.parse import urljoin, urlparse
+from xml.etree import ElementTree as ET
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service as ChromeService
@@ -62,10 +68,641 @@ def setup_driver():
     chrome_options.add_argument('--window-size=1920,1080')
     chrome_options.add_argument('--ignore-certificate-errors')
     chrome_options.add_argument('--ignore-ssl-errors')
-    
+
     service = ChromeService(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=chrome_options)
     return driver
+
+
+# ────────────────────────────────────────────────────────────────────
+# 상세 본문/첨부파일 추출 헬퍼
+#
+# 한국 공공기관 사이트의 표준 패턴: 웹 상세 페이지에는 메타데이터(제목·접수기간·
+# 담당자)만 있고, 진짜 사업 내용은 첨부 공고문(HWP/HWPX/PDF) 안에 있다.
+# 따라서 (1) HTML에서 키워드 영역 추출 → (2) 실패하면 첨부 PDF/HWPX 본문 추출
+# → (3) 본문에서 키워드 부근 200~500자 압축, 의 3-단계 휴리스틱을 적용한다.
+# ────────────────────────────────────────────────────────────────────
+
+SUMMARY_KEYWORDS = (
+    '사업개요', '사업목적', '사업내용', '지원내용', '지원대상',
+    '사업안내', '모집내용', '신청자격', '공고요지', '추진목적',
+    '지원자격', '지원분야', '신청대상', '사업기간', '모집분야',
+    '사업소개', '추진배경', '주요내용',
+)
+
+_ATTACH_EXT_RE = re.compile(r'\.(pdf|hwpx|hwp|docx?|xlsx?)(?:[?#&]|$)', re.I)
+_ATTACH_DOWNLOAD_HINTS = ('download', 'filedown', 'boardfile', 'streamdownload',
+                          'fileview', 'fncfiledownload', 'attach', 'getfile')
+
+# 첨부 파일명 우선순위 — 공고문류는 점수 높게, 양식/안내/포스터/별첨 등은 낮게.
+# (높은 score를 먼저 처리)
+def _attachment_score(filename):
+    fn = (filename or '').lower()
+    if not fn:
+        return 0
+    score = 0
+    # 본문성 키워드
+    for kw, w in (('공고문', 50), ('모집공고', 50), ('공고', 30),
+                  ('사업안내', 25), ('안내문', 20), ('faq', 15),
+                  ('사업개요', 40), ('사업계획', 25), ('지원사업', 20)):
+        if kw in fn:
+            score += w
+            break
+    # 비본문 키워드 (감점)
+    for kw, w in (('ksic', -40), ('포스터', -40), ('양식', -30),
+                  ('신청서', -25), ('서식', -25), ('동의서', -30),
+                  ('체크리스트', -20), ('별첨', -15), ('붙임2', -10),
+                  ('붙임3', -15), ('붙임4', -15)):
+        if kw in fn:
+            score += w
+    return score
+
+
+def _normalize_text(s):
+    if not s:
+        return ""
+    s = s.replace('\xa0', ' ').replace('​', '').replace('﻿', '')
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    out = '\n'.join(lines)
+    out = re.sub(r'[ \t]{2,}', ' ', out)
+    return out
+
+
+def _trim_summary(text, max_len=500):
+    text = _normalize_text(text)
+    if not text:
+        return ""
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 3] + "..."
+
+
+def extract_summary_from_html(html_or_soup):
+    """HTML에서 사업개요/사업목적 키워드 주변 텍스트를 500자 이내로 추출."""
+    if isinstance(html_or_soup, str):
+        soup = BeautifulSoup(html_or_soup, 'html.parser')
+    else:
+        soup = html_or_soup
+
+    parts = []
+
+    # 1) <th>/<dt> 라벨 + 인접 <td>/<dd> 패턴
+    for label_tag in soup.find_all(['th', 'dt']):
+        label = label_tag.get_text(' ', strip=True)
+        if not label or not any(kw in label for kw in SUMMARY_KEYWORDS):
+            continue
+        sib = label_tag.find_next_sibling(['td', 'dd'])
+        if sib:
+            txt = sib.get_text(' ', strip=True)
+            if txt and len(txt) > 8:
+                parts.append(f"[{label}] {txt}")
+
+    # 2) 라벨로 시작하는 li/p 텍스트 (○ 사업개요: ..., ㅇ 사업목적 ..., 등)
+    if not parts:
+        prefix_re = re.compile(r'^[\s○●◎□■▶▷ㅇ\-\d\.\)\]]*(' + '|'.join(SUMMARY_KEYWORDS) + r')\s*[:：\-]')
+        for tag in soup.find_all(['li', 'p', 'div']):
+            text = tag.get_text(' ', strip=True)
+            if not text or len(text) < 12 or len(text) > 1000:
+                continue
+            if prefix_re.match(text):
+                parts.append(text)
+
+    # 3) 게시판 본문 영역 통째로 (가장 큰 컨테이너 우선)
+    if not parts:
+        for sel in ['div.board-content', 'div.view_cont', 'div.bbs-content',
+                    'div.board-view', 'div.detail-content', 'div#bbsView',
+                    'div.view-content', 'td.cont', 'td.content',
+                    'div.contents-detail', 'div.view_box']:
+            el = soup.select_one(sel)
+            if el:
+                txt = el.get_text(' ', strip=True)
+                if txt and len(txt) > 80:
+                    parts.append(txt)
+                    break
+
+    return _trim_summary(' '.join(parts), max_len=500)
+
+
+def find_attachment_links(soup, base_url=""):
+    """상세 페이지에서 다운로드 가능한 PDF/HWPX/HWP/DOCX/XLSX 첨부 링크를 찾아 반환.
+
+    - <a href> + <a onclick> + 임의 onclick 핸들러 모두 검사
+    - URL에 확장자가 없으면 텍스트/형제 노드/onclick 인자에서 확장자 추정
+    - 파일명 기반 점수로 공고문류 우선 정렬
+    """
+    found = []
+    seen_urls = set()
+
+    def _detect_ext_from_text(*texts):
+        for t in texts:
+            if not t:
+                continue
+            m = _ATTACH_EXT_RE.search(t)
+            if m:
+                return m.group(1).lower()
+        return None
+
+    def _add(filename, url, ext):
+        if not url or url in seen_urls:
+            return
+        seen_urls.add(url)
+        found.append((filename, url, ext))
+
+    for a in soup.find_all('a'):
+        href = (a.get('href') or '').strip()
+        onclick = (a.get('onclick') or '').strip()
+        text = a.get_text(' ', strip=True)
+        # 형제/상위 텍스트 (파일명이 인접 노드에 표시되는 경우)
+        ancestor_texts = [text]
+        cur = a.parent
+        for _ in range(3):
+            if cur is None:
+                break
+            ancestor_texts.append(cur.get_text(' ', strip=True))
+            cur = cur.parent
+
+        candidates = []  # [(url_or_None, ext, filename)]
+
+        # 1) 일반 href (javascript: 제외)
+        if href and not href.startswith('#') and not href.lower().startswith('javascript:'):
+            ext = _detect_ext_from_text(href, *ancestor_texts)
+            if not ext and any(h in href.lower() for h in _ATTACH_DOWNLOAD_HINTS):
+                ext = _detect_ext_from_text(*ancestor_texts)
+            if ext:
+                full_url = urljoin(base_url, href) if base_url else href
+                # 파일명: 조상 텍스트 중 확장자 포함된 것 우선
+                fn = text or href.rsplit('/', 1)[-1]
+                for at in ancestor_texts:
+                    if _ATTACH_EXT_RE.search(at):
+                        # at에서 파일명만 추출 (확장자 포함 토큰)
+                        m = re.search(r'([\w\[\]\(\)\.\-가-힣 ]+\.(?:pdf|hwpx|hwp|docx?|xlsx?))', at, re.I)
+                        if m:
+                            fn = m.group(1).strip()
+                            break
+                candidates.append((full_url, ext, fn))
+
+        # 2) javascript: 콜백 안에 파일명이 있는 경우 — fncFileDownload('bbs', 'foo.pdf')
+        js_blob = href if href.lower().startswith('javascript:') else onclick
+        if js_blob:
+            m = re.search(r"['\"]([^'\"]*\.(pdf|hwpx|hwp|docx?|xlsx?))['\"]", js_blob, re.I)
+            if m:
+                fn = m.group(1)
+                ext = m.group(2).lower()
+                # JS 콜백은 다운로드 URL을 동적으로 만들어서, requests로는 호출 불가.
+                # 단 표시용으로 파일명만 기록해두면 디버깅에 도움.
+                _add(fn, f"js://{fn}", ext)
+
+        for url, ext, fn in candidates:
+            _add(fn, url, ext)
+
+    # onclick 속성을 가진 모든 요소(button, span 등) 검사 — 일부 사이트는 a가 아닌 곳에서 다운
+    for el in soup.find_all(attrs={'onclick': True}):
+        if el.name == 'a':
+            continue  # 이미 처리됨
+        onclick = el.get('onclick') or ''
+        m = re.search(r"['\"]([^'\"]*\.(pdf|hwpx|hwp|docx?|xlsx?))['\"]", onclick, re.I)
+        if m:
+            fn = m.group(1)
+            ext = m.group(2).lower()
+            _add(fn, f"js://{fn}", ext)
+
+    # 파일명 점수 + 확장자 우선순위로 정렬
+    ext_priority = {'pdf': 0, 'hwpx': 1, 'hwp': 2, 'docx': 3, 'doc': 4, 'xlsx': 5, 'xls': 6}
+    # js:// 항목은 후순위 (실제로 fetch 불가)
+    found.sort(key=lambda t: (
+        t[1].startswith('js://'),
+        -_attachment_score(t[0]),
+        ext_priority.get(t[2], 9),
+    ))
+    # js:// 항목은 결과에서 제외 (fetch 불가)
+    found = [t for t in found if not t[1].startswith('js://')]
+    return found
+
+
+def _find_attachments_in_raw_html(html, base_url=""):
+    """raw HTML에서 download URL + 확장자 패턴을 직접 검색 (a href 외 위치 대응)."""
+    found = []
+    seen = set()
+    # 패턴 A: URL이 .확장자로 끝나는 경우
+    re_a = re.compile(
+        r'["\'](/?[^"\'\s<>]+?\.(?:pdf|hwpx|hwp|docx?|xlsx?))(?=[?#"\'\s])',
+        re.I,
+    )
+    for m in re_a.finditer(html):
+        url = m.group(1)
+        if not url.startswith(('http://', 'https://', '/')):
+            continue
+        em = re.search(r'\.(pdf|hwpx|hwp|docx?|xlsx?)$', url, re.I)
+        if not em:
+            continue
+        ext = em.group(1).lower()
+        full_url = urljoin(base_url, url) if base_url and not url.startswith('http') else url
+        if full_url in seen:
+            continue
+        seen.add(full_url)
+        fn = url.rsplit('/', 1)[-1]
+        found.append((fn, full_url, ext))
+    # 패턴 B: download/stream 엔드포인트의 query string에 파일명
+    re_b = re.compile(
+        r'["\'](/?[^"\'\s<>]*?(?:download|stream|attach|filedown|getfile)[^"\'\s<>]*?[?&]'
+        r'(?:fileSaveNm|fileName|filename|filenm|attachNm|fileNm)=([^&"\']+?\.(?:pdf|hwpx|hwp|docx?|xlsx?)))(?=[&"\'])',
+        re.I,
+    )
+    for m in re_b.finditer(html):
+        url = m.group(1)
+        fn = m.group(2)
+        em = re.search(r'\.(pdf|hwpx|hwp|docx?|xlsx?)$', fn, re.I)
+        ext = em.group(1).lower() if em else 'pdf'
+        full_url = urljoin(base_url, url) if base_url and not url.startswith('http') else url
+        if full_url in seen:
+            continue
+        seen.add(full_url)
+        found.append((fn, full_url, ext))
+
+    # 패턴 C: 파일명 텍스트와 인접한 download URL을 페어링
+    # (전북TP 같이 <a>에는 '다운로드'만 있고 파일명은 별도 위치에 있는 경우)
+    fn_matches = list(re.finditer(
+        r'([^\s"\'<>]{2,80}\.(pdf|hwpx|hwp|docx?|xlsx?))(?:\s|\()',
+        html, re.I,
+    ))
+    dl_matches = list(re.finditer(
+        r'["\'](/?[^"\'\s<>]*?(?:download|fileDown|stream|attach|getfile)[^"\'\s<>]*?)["\']',
+        html, re.I,
+    ))
+    for dl in dl_matches:
+        url = dl.group(1)
+        full_url = urljoin(base_url, url) if base_url and not url.startswith('http') else url
+        if full_url in seen:
+            continue
+        # URL 자체에 확장자가 있으면 패턴 A에서 이미 처리됨 → skip
+        if _ATTACH_EXT_RE.search(url):
+            continue
+        # 가장 가까이 (앞쪽으로) 위치한 파일명 찾기
+        best_fn = None
+        best_dist = 1500
+        for fm in fn_matches:
+            if fm.end() <= dl.start():
+                dist = dl.start() - fm.end()
+                if dist < best_dist:
+                    best_dist = dist
+                    best_fn = fm
+        if not best_fn:
+            continue
+        fn = best_fn.group(1).strip()
+        # 파일명에서 한글/영문/숫자/괄호만 남기고 정리
+        fn = re.sub(r'[^\w\(\)\[\]가-힣\. \-]', '', fn).strip()
+        if len(fn) < 5:
+            continue
+        ext = best_fn.group(2).lower()
+        seen.add(full_url)
+        found.append((fn, full_url, ext))
+
+    ext_priority = {'pdf': 0, 'hwpx': 1, 'hwp': 2, 'docx': 3, 'doc': 4, 'xlsx': 5, 'xls': 6}
+    found.sort(key=lambda t: (-_attachment_score(t[0]), ext_priority.get(t[2], 9)))
+    return found
+
+
+# 사이트별 다운로드 URL 변환기 — javascript: 콜백을 직접 다운로드 가능한 URL로 매핑
+def _itp_attachment_resolver(soup, base_url):
+    """인천테크노파크: javascript:fncFileDownload('bbs','xxx.pdf') → 다운로드 URL 추정.
+
+    ITP는 fncFileDownload(boardId, savedFileName)이 form post로 처리하지만,
+    /upload/<boardId>/<savedFileName> 패턴으로 직접 접근 가능한 경우가 많다.
+    여러 후보 경로를 시도해서 첫 번째 200 응답을 사용.
+    """
+    found = []
+    for a in soup.find_all('a', href=True):
+        href = a.get('href', '')
+        text = a.get_text(' ', strip=True)
+        if not href.lower().startswith('javascript:fncfiledownload'):
+            continue
+        m = re.search(r"fncFileDownload\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]", href, re.I)
+        if not m:
+            continue
+        board, savedfn = m.group(1), m.group(2)
+        em = re.search(r'\.(pdf|hwpx|hwp|docx?|xlsx?)$', savedfn, re.I)
+        if not em:
+            continue
+        ext = em.group(1).lower()
+        # 후보 URL 패턴들 (사이트별로 다름)
+        candidates = [
+            f"https://www.itp.or.kr/upload/{board}/{savedfn}",
+            f"https://www.itp.or.kr/upload/bbs/{savedfn}",
+            f"https://www.itp.or.kr/uploadbbs/{savedfn}",
+            f"https://www.itp.or.kr/data/{board}/{savedfn}",
+            f"https://www.itp.or.kr/data/upload/{savedfn}",
+        ]
+        # 표시용 파일명은 a 태그의 텍스트 우선
+        display_fn = text or savedfn
+        for cand in candidates:
+            found.append((display_fn, cand, ext))
+    return found
+
+
+def extract_text_from_pdf(url, session=None, timeout=15, max_pages=5, referer=None):
+    """원격 PDF에서 텍스트를 추출. pdfplumber 미설치 또는 비번 PDF는 빈 문자열."""
+    try:
+        import pdfplumber
+    except ImportError:
+        return ""
+    s = session or GLOBAL_SESSION
+    try:
+        # HTML escape entity 정리 (&amp; → &)
+        import html as _html
+        url = _html.unescape(url)
+        headers = {}
+        if referer:
+            headers['Referer'] = referer
+        r = s.get(url, timeout=timeout, verify=False, headers=headers or None)
+        if r.status_code != 200 or not r.content:
+            return ""
+        # PDF 시그니처 검증 (서버가 HTML 에러 페이지 반환했을 수 있음)
+        if not r.content.startswith(b'%PDF'):
+            return ""
+        with pdfplumber.open(io.BytesIO(r.content)) as pdf:
+            pages_text = []
+            for i, page in enumerate(pdf.pages):
+                if i >= max_pages:
+                    break
+                try:
+                    t = page.extract_text() or ""
+                except Exception:
+                    t = ""
+                pages_text.append(t)
+            return _normalize_text('\n'.join(pages_text))
+    except Exception:
+        return ""
+
+
+def extract_text_from_hwpx(url, session=None, timeout=15, referer=None):
+    """HWPX(zip + xml) 파일에서 텍스트를 추출."""
+    s = session or GLOBAL_SESSION
+    try:
+        import html as _html
+        url = _html.unescape(url)
+        headers = {'Referer': referer} if referer else None
+        r = s.get(url, timeout=timeout, verify=False, headers=headers)
+        if r.status_code != 200 or not r.content:
+            return ""
+        # ZIP 시그니처 검증
+        if not r.content.startswith(b'PK'):
+            return ""
+        texts = []
+        with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+            section_names = sorted(
+                n for n in zf.namelist()
+                if n.startswith('Contents/section') and n.endswith('.xml')
+            )
+            for name in section_names[:5]:
+                try:
+                    data = zf.read(name)
+                    root = ET.fromstring(data)
+                except (ET.ParseError, KeyError, zipfile.BadZipFile):
+                    continue
+                for elem in root.iter():
+                    t = elem.text
+                    if t and t.strip():
+                        texts.append(t.strip())
+        return _normalize_text(' '.join(texts))
+    except Exception:
+        return ""
+
+
+def extract_text_from_hwp(url, session=None, timeout=15, referer=None):
+    """HWP(구형 OLE) 파일에서 본문 텍스트 추출.
+
+    HWP 5.x은 OLE compound document 안에 BodyText/SectionN 스트림이 있고,
+    HWPHeader 의 PROP 비트0이 1이면 raw deflate(zlib raw)로 압축돼 있다.
+    Section 안은 HWP record 포맷 — tag/level/size 헤더 4바이트 + 본문.
+    PARA_TEXT(tag=HWPTAG_BEGIN+51=67) record 의 UTF-16-LE 디코딩 → 단락 텍스트.
+    """
+    try:
+        import olefile
+    except ImportError:
+        return ""
+    s = session or GLOBAL_SESSION
+    try:
+        import html as _html
+        url = _html.unescape(url)
+        headers = {'Referer': referer} if referer else None
+        r = s.get(url, timeout=timeout, verify=False, headers=headers)
+        if r.status_code != 200 or not r.content:
+            return ""
+        # OLE 시그니처 검증 (D0CF11E0...)
+        if not r.content.startswith(b'\xd0\xcf\x11\xe0'):
+            return ""
+        ole = olefile.OleFileIO(io.BytesIO(r.content))
+        try:
+            if not ole.exists('FileHeader'):
+                return ""
+            header = ole.openstream('FileHeader').read()
+            if not header.startswith(b'HWP Document File'):
+                return ""
+            # Properties: byte 36, bit 0 = compressed, bit 1 = encrypted
+            if len(header) <= 36:
+                return ""
+            props = header[36]
+            compressed = (props & 0x01) != 0
+            encrypted = (props & 0x02) != 0
+            if encrypted:
+                return ""
+
+            section_paths = []
+            for entry in ole.listdir():
+                if (len(entry) == 2 and entry[0] == 'BodyText'
+                        and entry[1].lower().startswith('section')):
+                    section_paths.append(entry)
+            section_paths.sort(key=lambda p: p[1])
+
+            HWPTAG_BEGIN = 0x10
+            # HWP record tag — PARA_TEXT = HWPTAG_BEGIN(16) + 51 = 67
+            PARA_TEXT_TAG = HWPTAG_BEGIN + 51
+
+            all_texts = []
+            for path in section_paths[:6]:  # 처음 6개 섹션만
+                try:
+                    raw = ole.openstream(path).read()
+                    if compressed:
+                        try:
+                            raw = zlib.decompress(raw, -15)  # raw deflate
+                        except zlib.error:
+                            continue
+                    pos = 0
+                    section_texts = []
+                    while pos + 4 <= len(raw):
+                        h = struct.unpack('<I', raw[pos:pos + 4])[0]
+                        tag_id = h & 0x3FF
+                        # level = (h >> 10) & 0x3FF  # unused
+                        size = (h >> 20) & 0xFFF
+                        pos += 4
+                        if size == 0xFFF:
+                            if pos + 4 > len(raw):
+                                break
+                            size = struct.unpack('<I', raw[pos:pos + 4])[0]
+                            pos += 4
+                        if pos + size > len(raw):
+                            break
+                        rec_data = raw[pos:pos + size]
+                        pos += size
+                        if tag_id == PARA_TEXT_TAG and size > 0:
+                            try:
+                                txt = rec_data.decode('utf-16-le', errors='ignore')
+                            except Exception:
+                                continue
+                            # 제어문자/특수문자 제거 (한글 BMP는 보존)
+                            cleaned = []
+                            for ch in txt:
+                                code = ord(ch)
+                                if ch in ' \n\t' or 0x20 <= code < 0xD800 or 0xE000 <= code < 0xFFFE:
+                                    cleaned.append(ch)
+                            t = ''.join(cleaned).strip()
+                            if t:
+                                section_texts.append(t)
+                    if section_texts:
+                        all_texts.append(' '.join(section_texts))
+                except Exception:
+                    continue
+            return _normalize_text(' '.join(all_texts))
+        finally:
+            ole.close()
+    except Exception:
+        return ""
+
+
+def summarize_long_text(text, max_len=500):
+    """PDF/HWPX 본문에서 사업개요 영역 추출. 키워드 부근 우선, 없으면 앞부분."""
+    text = _normalize_text(text)
+    if not text:
+        return ""
+    best_idx, best_kw = -1, None
+    for kw in SUMMARY_KEYWORDS:
+        idx = text.find(kw)
+        if idx >= 0 and (best_idx < 0 or idx < best_idx):
+            best_idx, best_kw = idx, kw
+    if best_idx >= 0:
+        chunk = text[best_idx:best_idx + max_len + 200]
+        return _trim_summary(chunk, max_len=max_len)
+    # 키워드 못 찾음: 앞부분에서 메타데이터(공고번호/연락처) 건너뛰고 본문 시작 추정
+    lines = text.split('\n')
+    body_start = 0
+    for i, ln in enumerate(lines):
+        if len(ln) > 30 and not re.match(r'^[\s\-=─━〓]+$', ln):
+            body_start = i
+            break
+    body = '\n'.join(lines[body_start:body_start + 30])
+    return _trim_summary(body, max_len=max_len)
+
+
+def enrich_detail(item, ctx=None):
+    """item['링크'] 페이지를 fetch → HTML/첨부 → 사업개요 채움. item을 in-place 수정."""
+    ctx = ctx or {}
+    link = (item.get('링크') or '').strip()
+    if not link:
+        return item
+
+    existing = (item.get('사업개요') or '').strip()
+    # 이미 충분히 긴 사업개요가 있으면 skip (다른 사이트의 기존 결과 보호).
+    # '내용 추출 실패'/'크롤링 오류'/'링크 없음' 등 placeholder는 무시하고 재시도.
+    if len(existing) >= 80 and not any(
+        p in existing for p in ('추출 실패', '크롤링 오류', '링크 없음')
+    ):
+        return item
+    if any(p in existing for p in ('추출 실패', '크롤링 오류', '링크 없음')):
+        item['사업개요'] = ''  # placeholder 제거
+
+    session = ctx.get('session') or GLOBAL_SESSION
+    base_url = ctx.get('base_url') or ('/'.join(link.split('/')[:3]) if link.startswith('http') else '')
+
+    html = ""
+    driver = ctx.get('driver')
+    if driver is not None:
+        try:
+            driver.get(link)
+            time.sleep(ctx.get('spa_wait', 1.5))
+            html = driver.page_source
+        except Exception:
+            return item
+    else:
+        # 일시적 5xx 에러는 1회 재시도
+        for attempt in range(2):
+            try:
+                r = session.get(link, timeout=10, verify=False)
+                if r.status_code == 200:
+                    r.encoding = r.apparent_encoding or r.encoding
+                    html = r.text
+                    break
+                if r.status_code in (500, 502, 503, 504) and attempt == 0:
+                    time.sleep(1.5)
+                    continue
+                return item
+            except Exception:
+                if attempt == 0:
+                    time.sleep(1.0)
+                    continue
+                return item
+
+    if not html:
+        return item
+    soup = BeautifulSoup(html, 'html.parser')
+
+    summary = ""
+    custom = ctx.get('html_processor')
+    if custom:
+        try:
+            summary = custom(soup) or ""
+        except Exception:
+            summary = ""
+    if not summary or len(summary) < 50:
+        summary = extract_summary_from_html(soup) or summary
+
+    # HTML에서 충분히 못 얻으면 첨부파일 시도 (PDF > HWPX > HWP 순)
+    if (not summary or len(summary) < 60) and ctx.get('use_attachments', True):
+        attachments = find_attachment_links(soup, base_url=base_url)
+        # 사이트별 추가 후처리: ITP 같이 javascript 콜백만 있는 사이트
+        site_resolver = ctx.get('attachment_resolver')
+        if site_resolver:
+            try:
+                extra = site_resolver(soup, base_url) or []
+                attachments = list(attachments) + list(extra)
+            except Exception:
+                pass
+        # 실패 시 raw HTML regex로 다운로드 URL 후보 추가
+        if not attachments:
+            extra = _find_attachments_in_raw_html(html, base_url)
+            attachments = list(extra)
+
+        for fname, furl, ext in attachments:
+            txt = ""
+            # Referer를 상세 페이지로 설정 — 일부 사이트는 referer 검증으로 차단
+            if ext == 'pdf':
+                txt = extract_text_from_pdf(furl, session=session, referer=link)
+            elif ext == 'hwpx':
+                txt = extract_text_from_hwpx(furl, session=session, referer=link)
+            elif ext == 'hwp':
+                txt = extract_text_from_hwp(furl, session=session, referer=link)
+            if txt and len(txt) > 100:
+                summary = summarize_long_text(txt, max_len=500)
+                break
+
+    if summary:
+        item['사업개요'] = summary
+    return item
+
+
+def crawl_generic_details(items, max_workers=4, ctx=None):
+    """범용 상세 enrichment — Phase 2 사이트들 공용."""
+    if not items:
+        return items
+
+    def _one(it):
+        try:
+            return enrich_detail(it, ctx=ctx)
+        except Exception:
+            return it
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        return list(ex.map(_one, items))
+
 
 def crawl_bizinfo_list(driver):
     print(f"비즈인포(bizinfo.go.kr) 목록 크롤링 시작 (페이지 {START_PAGE} ~ {END_PAGE})...")
@@ -1633,10 +2270,26 @@ def crawl_cbtp_list(end_page=3):
 
 def crawl_cbtp_details(data_list):
     """
-    충북테크노파크 상세 크롤링 (상세 내용 없음)
-    - 목록에서 이미 필요한 정보를 수집했으므로 그대로 반환
+    충북테크노파크 상세 크롤링 — DESAdapter 세션으로 enrich_detail 호출.
+    레거시 SSL(DH_KEY_TOO_SMALL) 때문에 GLOBAL_SESSION으로는 접속 불가.
     """
-    return data_list
+    if not data_list:
+        return data_list
+    cbtp_session = requests.Session()
+    cbtp_session.verify = False
+    cbtp_session.headers.update(GLOBAL_SESSION.headers)
+    cbtp_session.mount('https://', DESAdapter())
+
+    ctx = {'session': cbtp_session, 'base_url': 'https://www.cbtp.or.kr'}
+
+    def _one(it):
+        try:
+            return enrich_detail(it, ctx=ctx)
+        except Exception:
+            return it
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        return list(ex.map(_one, data_list))
 
 
 
@@ -2429,7 +3082,7 @@ def _crawl_single_sbiz24_detail(item, index, total):
 
     try:
         driver.get(link)
-        time.sleep(0.5)
+        time.sleep(1.0)  # SPA 렌더 대기 (기존 0.5는 너무 짧음)
 
         content = ""
 
@@ -2452,6 +3105,33 @@ def _crawl_single_sbiz24_detail(item, index, total):
             try:
                 label = driver.find_element(By.XPATH, "//label[contains(text(), '공고내용')]")
                 content = label.find_element(By.XPATH, "following-sibling::div").text.strip()
+            except:
+                pass
+
+        # Case 4: 일반 HTML 키워드 추출 (렌더된 DOM 통째로)
+        if not content or len(content) < 30:
+            try:
+                soup = BeautifulSoup(driver.page_source, 'html.parser')
+                generic = extract_summary_from_html(soup)
+                if generic and len(generic) > 30:
+                    content = generic
+            except:
+                pass
+
+        # Case 5: 첨부 PDF/HWPX 본문 추출 fallback
+        if not content or len(content) < 30:
+            try:
+                soup = BeautifulSoup(driver.page_source, 'html.parser')
+                base_url = '/'.join(link.split('/')[:3]) if link.startswith('http') else 'https://www.sbiz24.kr'
+                for fname, furl, ext in find_attachment_links(soup, base_url=base_url):
+                    txt = ""
+                    if ext == 'pdf':
+                        txt = extract_text_from_pdf(furl)
+                    elif ext == 'hwpx':
+                        txt = extract_text_from_hwpx(furl)
+                    if txt and len(txt) > 100:
+                        content = summarize_long_text(txt, max_len=500)
+                        break
             except:
                 pass
 
@@ -2574,11 +3254,15 @@ def main():
         # driver 상태 확인 및 재사용
         if driver is None:
              driver = setup_driver()
-             
+
         itp_results = crawl_itp_list(driver)
         if itp_results:
+             # 상세 페이지(`intro.asp?seq=N`)는 정적 HTML — ITP의 fncFileDownload
+             # JS 콜백은 attachment_resolver로 다운로드 URL 후보를 추정
+             itp_ctx = {'attachment_resolver': _itp_attachment_resolver}
+             itp_results = crawl_generic_details(itp_results, max_workers=4, ctx=itp_ctx)
              final_results.extend(itp_results)
-             
+
     except Exception as e:
         print(f"[오류] 인천테크노파크 크롤링 실패: {e}")
 
@@ -2592,11 +3276,16 @@ def main():
 
     # ── Phase 2: requests 기반 크롤러 병렬 실행 (독립적 13개 사이트) ──
     def _run_requests_crawler(name, fn_list, fn_detail=None, end_page=END_PAGE):
-        """requests 기반 크롤러 실행 래퍼 (list + optional detail)"""
+        """requests 기반 크롤러 실행 래퍼 (list + optional site-specific detail + generic enrichment)"""
         try:
             items = fn_list(end_page=end_page) if end_page else fn_list()
             if items and fn_detail:
                 items = fn_detail(items)
+            # 사이트별 detail 크롤러로 사업개요를 못 채웠거나 짧은 항목은
+            # 일반 enrichment(HTML 키워드 + 첨부 PDF/HWPX 추출)로 보강.
+            # enrich_detail() 안에서 사업개요 ≥80자면 자동 skip.
+            if items:
+                items = crawl_generic_details(items, max_workers=3)
             return items or []
         except Exception as e:
             print(f"[오류] {name} 크롤링 실패: {e}")
@@ -2650,8 +3339,11 @@ def main():
         # Selenium 사용 (Vue.js 동적 렌더링), 1페이지만 크롤링
         jtp_list = crawl_jtp_list(driver=driver, end_page=1)
         if jtp_list:
-             # 상세 내용 없음
-             final_results.extend(jtp_list)
+            # JTP 상세도 SPA — 동일 driver로 순차 enrichment
+            print(f"[제주테크노파크] {len(jtp_list)}개 항목 상세 수집 시작...")
+            ctx = {'driver': driver, 'spa_wait': 2.0}
+            jtp_list = [enrich_detail(it, ctx=ctx) for it in jtp_list]
+            final_results.extend(jtp_list)
     except Exception as e:
         print(f"[오류] 제주테크노파크 크롤링 실패: {e}")
 
