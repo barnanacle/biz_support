@@ -1,5 +1,5 @@
 {
-  "last_updated": "2026-04-25 02:30:24",
+  "last_updated": "2026-04-25 13:06:48",
   "data": [
     {
       "지원사업명": "[인천] 2026년 인천형 특별 경영안정자금 지원 공고(금융비용 확대 지원을 위한 하나은행 출연 및 협업)",
@@ -2546,14 +2546,6 @@
       "first_seen": "2026-04-25"
     },
     {
-      "출처": "포항테크노파크",
-      "지원사업명": "2026년 스마트 제조혁신 지원사업 통합공고",
-      "신청기간": "~ 2026-12-31",
-      "링크": "https://www.ptp.or.kr/main/board/view.do?menu_idx=116&manage_idx=15&board_idx=7530",
-      "사업개요": "[신청자격] 국내 중소·중견 제조기업 등",
-      "first_seen": "2026-04-25"
-    },
-    {
       "출처": "충북테크노파크",
       "지원사업명": "2026년 오픈랩 공유오피스 사용기업 모집 공고",
       "신청기간": "2026-01-01 ~2026-12-31",
@@ -2567,6 +2559,14 @@
       "신청기간": "20260213 ~2026-12-31",
       "링크": "https://www.cbtp.or.kr/index.php?control=bbs&board_id=saup_notice&mode=view&no=262&offset=1&page=1&list_mode=&&categ=&lm_uid=387",
       "사업개요": "",
+      "first_seen": "2026-04-25"
+    },
+    {
+      "출처": "포항테크노파크",
+      "지원사업명": "2026년 스마트 제조혁신 지원사업 통합공고",
+      "신청기간": "~ 2026-12-31",
+      "링크": "https://www.ptp.or.kr/main/board/view.do?menu_idx=116&manage_idx=15&board_idx=7530",
+      "사업개요": "[신청자격] 국내 중소·중견 제조기업 등",
       "first_seen": "2026-04-25"
     },
     {
@@ -3082,6 +3082,22 @@
       "first_seen": "2026-04-25"
     },
     {
+      "출처": "충북테크노파크",
+      "지원사업명": "2026년 콘크리트 2차 제품 제조기업 및 레미콘 기업지원 4차 수혜기업 모집공고",
+      "신청기간": "2026-04-06 ~2026-04-30",
+      "링크": "https://www.cbtp.or.kr/index.php?control=bbs&board_id=saup_notice&mode=view&no=contact_2496&offset=1&page=1&list_mode=&&categ=&lm_uid=387",
+      "사업개요": "",
+      "first_seen": "2026-04-25"
+    },
+    {
+      "출처": "충북테크노파크",
+      "지원사업명": "2026년 충북 스마트공장 테스트베드 기술지원사업 모집공고(연장)",
+      "신청기간": "2026-03-04 ~2026-04-30",
+      "링크": "https://www.cbtp.or.kr/index.php?control=bbs&board_id=saup_notice&mode=view&no=contact_2468&offset=1&page=1&list_mode=&&categ=&lm_uid=387",
+      "사업개요": "",
+      "first_seen": "2026-04-25"
+    },
+    {
       "출처": "포항테크노파크",
       "지원사업명": "「2026년 해양기업 혁신성장 R&BD패키지 지원사업」지원기업 모집공고",
       "신청기간": "2026-04-17 09시 ~ 2026-04-30 17시",
@@ -3111,22 +3127,6 @@
       "신청기간": "2026-04-01 ~ 2026-04-30",
       "링크": "https://www.ptp.or.kr/main/board/view.do?menu_idx=116&manage_idx=15&board_idx=7744",
       "사업개요": "[신청자격] 포항 내 중소·중견 제조기업",
-      "first_seen": "2026-04-25"
-    },
-    {
-      "출처": "충북테크노파크",
-      "지원사업명": "2026년 콘크리트 2차 제품 제조기업 및 레미콘 기업지원 4차 수혜기업 모집공고",
-      "신청기간": "2026-04-06 ~2026-04-30",
-      "링크": "https://www.cbtp.or.kr/index.php?control=bbs&board_id=saup_notice&mode=view&no=contact_2496&offset=1&page=1&list_mode=&&categ=&lm_uid=387",
-      "사업개요": "",
-      "first_seen": "2026-04-25"
-    },
-    {
-      "출처": "충북테크노파크",
-      "지원사업명": "2026년 충북 스마트공장 테스트베드 기술지원사업 모집공고(연장)",
-      "신청기간": "2026-03-04 ~2026-04-30",
-      "링크": "https://www.cbtp.or.kr/index.php?control=bbs&board_id=saup_notice&mode=view&no=contact_2468&offset=1&page=1&list_mode=&&categ=&lm_uid=387",
-      "사업개요": "",
       "first_seen": "2026-04-25"
     },
     {
