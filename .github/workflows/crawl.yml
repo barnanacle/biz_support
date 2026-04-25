@@ -106,6 +106,20 @@ jobs:
             exit 1
           fi
 
+          # 항목 수가 이전 대비 30% 이상 줄어들면 사이트 다수가 일시적으로 크롤링 실패한
+          # 것으로 보고 거부 — 기존 데이터 유지. (정상 변동은 ±10% 수준.)
+          OLD_COUNT=$(python3 -c "import json; print(len(json.load(open('data.json','r',encoding='utf-8')).get('data',[])))")
+          NEW_COUNT=$(python3 -c "import json; print(len(json.load(open('$NEW_PATH','r',encoding='utf-8')).get('data',[])))")
+          echo "항목 수: ${OLD_COUNT} → ${NEW_COUNT}"
+          if [ "$OLD_COUNT" -gt 100 ]; then
+            MIN_COUNT=$((OLD_COUNT * 70 / 100))
+            if [ "$NEW_COUNT" -lt "$MIN_COUNT" ]; then
+              echo "::error::항목 수 급감(${OLD_COUNT} → ${NEW_COUNT}, 최소 ${MIN_COUNT} 필요). 다수 사이트 일시적 실패로 판단, 기존 데이터 유지."
+              echo "updated=false" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+          fi
+
           cp "$NEW_PATH" data.json
           echo "updated=true" >> "$GITHUB_OUTPUT"
           echo "✅ data.json 업데이트 완료 (${NEW_SIZE} bytes, last_updated=${NEW_LAST_UPDATED})"
