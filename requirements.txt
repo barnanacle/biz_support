@@ -6,3 +6,9 @@ openpyxl==3.1.5
 urllib3==2.5.0
 pdfplumber==0.11.4
 olefile==0.47
+# Scrapling: curl_cffi 기반 TLS 지문 스푸핑 + HTTP/2 fetcher.
+# Phase 2 requests 기반 13개 사이트의 fetch를 가속·차단회피용으로 사용.
+# [fetchers] extras = curl_cffi + browserforge + playwright(SDK only) 등 의존성 자동 해결.
+# Playwright 브라우저 바이너리는 따로 다운로드 안 함(`playwright install` 미호출) → CI 추가 시간 미미.
+# import 실패해도 unified_crawler.fetch_html이 requests로 자동 fallback → 운영 무중단.
+scrapling[fetchers]==0.4.7

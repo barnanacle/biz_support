@@ -36,6 +36,103 @@ GLOBAL_SESSION.headers.update({
 
 # 병렬 처리 Worker 수
 MAX_WORKERS = 5
+PHASE2_WORKERS = 12  # Phase 2 requests 병렬 worker (Scrapling 도입 후 8 → 12 상향)
+
+# ────────────────────────────────────────────────────────────────────
+# Scrapling Fetcher (curl_cffi 기반 TLS fingerprint spoofing + HTTP/2)
+# ────────────────────────────────────────────────────────────────────
+# 도입 배경: 한국 공공기관 사이트 일부가 기본 requests UA를 차단하거나 HTTP/1.1
+# 만 응답 → 차단/지연이 누적. Scrapling Fetcher는 실제 Chrome의 TLS 지문을
+# 흉내내고 HTTP/2를 지원해서 차단률·latency가 동시에 개선된다 (BS4 대비 파서
+# 속도는 부수적 이득).
+#
+# 운영 안전장치:
+#   1) Scrapling import 실패해도 requests fallback으로 100% 기존 동작 유지.
+#   2) DESAdapter(레거시 SSL) 등 특수 session이 명시되면 Scrapling 건너뜀.
+#   3) Fetcher 호출이 예외/빈 본문을 던지면 조용히 requests로 폴백.
+# ────────────────────────────────────────────────────────────────────
+_SCRAPLING_FETCHER = None
+try:
+    from scrapling.fetchers import Fetcher as _ScraplingFetcher  # type: ignore
+    _SCRAPLING_FETCHER = _ScraplingFetcher
+    print("[Scrapling] Fetcher 활성화 (curl_cffi + TLS spoofing)")
+except Exception as _scrapling_import_err:
+    print(f"[Scrapling] 미설치 — 기존 requests로 동작합니다 ({_scrapling_import_err})")
+
+
+def _merge_url_params(url, params):
+    """URL 쿼리스트링에 dict params를 병합해 새 URL 반환."""
+    if not params:
+        return url
+    from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
+    parsed = urlparse(url)
+    merged = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    for k, v in params.items():
+        merged[str(k)] = str(v)
+    return urlunparse(parsed._replace(query=urlencode(merged)))
+
+
+def fetch_html(url, *, session=None, timeout=20, params=None, headers=None,
+               encoding=None, allow_scrapling=True):
+    """
+    공용 HTML fetcher. Scrapling Fetcher → requests 순서로 시도하고 raw text(str) 반환.
+
+    Args:
+      url: 요청 URL
+      session: 명시되면 Scrapling을 건너뛰고 이 session으로만 요청 (예: CBTP DESAdapter)
+      timeout: 초 단위
+      params: dict이면 URL에 자동 병합 (양쪽 백엔드 일관 동작 보장)
+      headers: 추가 헤더 (UA 등)
+      encoding: 'EUC-KR' 등 강제 인코딩. None이면 자동 감지.
+      allow_scrapling: False로 호출하면 무조건 requests 경로 사용 (디버깅용).
+
+    Returns:
+      HTML 문자열. 두 경로 모두 실패하면 마지막 예외를 그대로 raise.
+    """
+    final_url = _merge_url_params(url, params)
+
+    # 1) Scrapling Fetcher 시도 — 단, 명시 session이 없을 때만
+    if session is None and allow_scrapling and _SCRAPLING_FETCHER is not None:
+        try:
+            kwargs = {'timeout': timeout}
+            try:
+                # 지원하지 않는 버전이면 TypeError로 빠지고 fallback
+                kwargs['impersonate'] = 'chrome120'
+            except Exception:
+                pass
+            if headers:
+                kwargs['headers'] = headers
+            page = _SCRAPLING_FETCHER.get(final_url, **kwargs)
+
+            # 응답 본문 추출 — Scrapling 버전에 따라 attribute가 다르다
+            body = getattr(page, 'body', None)
+            if isinstance(body, (bytes, bytearray)):
+                if encoding:
+                    return body.decode(encoding, errors='replace')
+                try:
+                    return body.decode('utf-8')
+                except UnicodeDecodeError:
+                    return body.decode('cp949', errors='replace')
+            for attr in ('text', 'html_content'):
+                t = getattr(page, attr, None)
+                if isinstance(t, str) and len(t) > 50:
+                    return t
+            s = str(page)
+            if s and len(s) > 50:
+                return s
+        except Exception:
+            # 조용히 fallback — 운영 중단 방지
+            pass
+
+    # 2) Fallback: 전달된 session 또는 GLOBAL_SESSION
+    sess = session or GLOBAL_SESSION
+    r = sess.get(final_url, headers=headers, timeout=timeout, verify=False)
+    r.raise_for_status()
+    if encoding:
+        r.encoding = encoding
+    elif not r.encoding or r.encoding.lower() == 'iso-8859-1':
+        r.encoding = r.apparent_encoding or r.encoding
+    return r.text
 
 # SSL Adapter for legacy servers (DH_KEY_TOO_SMALL)
 class DESAdapter(requests.adapters.HTTPAdapter):
@@ -623,15 +720,20 @@ def enrich_detail(item, ctx=None):
         except Exception:
             return item
     else:
-        # 일시적 5xx 에러는 1회 재시도
+        # 일시적 5xx/네트워크 에러는 1회 재시도. fetch_html이 Scrapling Fetcher
+        # (TLS 스푸핑) 우선, 실패 시 session으로 fallback. CBTP처럼 DESAdapter
+        # session이 명시된 경우는 Scrapling 건너뛰고 session 직접 사용.
+        # GLOBAL_SESSION은 명시 안 한 것과 동일하게 처리해서 Scrapling 경로를 활성화.
+        fetch_session = None if session is GLOBAL_SESSION else session
         for attempt in range(2):
             try:
-                r = session.get(link, timeout=10, verify=False)
-                if r.status_code == 200:
-                    r.encoding = r.apparent_encoding or r.encoding
-                    html = r.text
+                html = fetch_html(link, session=fetch_session, timeout=10)
+                if html:
                     break
-                if r.status_code in (500, 502, 503, 504) and attempt == 0:
+                return item
+            except requests.exceptions.HTTPError as he:
+                code = getattr(getattr(he, 'response', None), 'status_code', 0)
+                if code in (500, 502, 503, 504) and attempt == 0:
                     time.sleep(1.5)
                     continue
                 return item
@@ -1168,9 +1270,8 @@ def crawl_dgtp_list(end_page=3):
                 'bbsId': 'BBSMSTR_000000000003',
                 'pageIndex': page
             }
-            response = GLOBAL_SESSION.get(base_url, params=params)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
+            html = fetch_html(base_url, params=params, timeout=20)
+            soup = BeautifulSoup(html, 'html.parser')
             
             rows = soup.select('table tbody tr')
             if not rows:
@@ -1431,10 +1532,9 @@ def crawl_gjtp_list(end_page=10):
     for page in range(1, end_page + 1):
         try:
             params = {'pageIndex': page}
-            response = GLOBAL_SESSION.get(base_url, params=params)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
+            html = fetch_html(base_url, params=params, timeout=20)
+            soup = BeautifulSoup(html, 'html.parser')
+
             table = soup.find('table')
             if not table:
                 print(f"  {page}페이지: 테이블을 찾을 수 없습니다.")
@@ -1504,9 +1604,8 @@ def crawl_gjtp_details(data_list):
             item['사업개요'] = ''
             return item
         try:
-            response = GLOBAL_SESSION.get(link, timeout=10)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
+            html = fetch_html(link, timeout=10)
+            soup = BeautifulSoup(html, 'html.parser')
             target_th = soup.find('th', string=lambda t: t and '사업목적' in t.strip())
             content = ""
             if target_th:
@@ -1540,9 +1639,8 @@ def crawl_djtp_list(end_page=10):
                 'mid': 'a20101000000',
                 'nPage': page
             }
-            response = GLOBAL_SESSION.get(base_url, params=params)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
+            html = fetch_html(base_url, params=params, timeout=20)
+            soup = BeautifulSoup(html, 'html.parser')
             
             # 테이블 찾기: '사업신청' 헤더가 있는 테이블 찾기
             target_table = None
@@ -1766,9 +1864,8 @@ def crawl_sjtp_list(end_page=5):
                 'bo_table': 'business01',
                 'page': page
             }
-            response = GLOBAL_SESSION.get(base_url, params=params, headers=headers)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
+            html = fetch_html(base_url, params=params, headers=headers, timeout=20)
+            soup = BeautifulSoup(html, 'html.parser')
             
             # 테이블 찾기: '진행상태'가 포함된 첫 번째 테이블
             tables = soup.find_all('table')
@@ -1852,9 +1949,8 @@ def crawl_gtp_list(end_page=5):
             params = {
                 'pageIndex': page
             }
-            response = GLOBAL_SESSION.get(base_url, params=params, headers=headers)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
+            html = fetch_html(base_url, params=params, headers=headers, timeout=20)
+            soup = BeautifulSoup(html, 'html.parser')
 
             # 테이블 찾기: '공고 제목'과 '상태'가 포함된 테이블
             tables = soup.find_all('table')
@@ -1954,9 +2050,8 @@ def crawl_gdtp_list(end_page=5):
             params = {
                 'page': page
             }
-            response = GLOBAL_SESSION.get(base_url, params=params, headers=headers)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
+            html = fetch_html(base_url, params=params, headers=headers, timeout=20)
+            soup = BeautifulSoup(html, 'html.parser')
             
             rows = soup.select('div.tbl.type_bbs div.tbody div.colgroup')
             if not rows:
@@ -2031,8 +2126,8 @@ def crawl_gdtp_details(data_list):
 
     def _fetch(item):
         try:
-            r = GLOBAL_SESSION.get(item['링크'], headers=_hdrs, timeout=10)
-            soup = BeautifulSoup(r.text, 'html.parser')
+            html = fetch_html(item['링크'], headers=_hdrs, timeout=10)
+            soup = BeautifulSoup(html, 'html.parser')
 
             # 사업개요 추출
             div = soup.find('div', id='post-content')
@@ -2079,10 +2174,9 @@ def crawl_gwtp_list(end_page=3):
             params_str = base_params_tmpl.format(page_offset)
             encoded_params = base64.b64encode(params_str.encode('utf-8')).decode('utf-8')
             url = f"https://www.gwtp.or.kr/gwtp/bbsNew_list.php?bbs_data={encoded_params}"
-            
-            response = GLOBAL_SESSION.get(url, headers=headers)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
+
+            html = fetch_html(url, headers=headers, timeout=20)
+            soup = BeautifulSoup(html, 'html.parser')
             
             rows = soup.select('table tbody tr')
             if not rows:
@@ -2159,8 +2253,8 @@ def crawl_gwtp_details(data_list):
 
     def _fetch(item):
         try:
-            r = GLOBAL_SESSION.get(item['\ub9c1\ud06c'], headers=_hdrs, timeout=10)
-            soup = BeautifulSoup(r.text, 'html.parser')
+            html = fetch_html(item['\ub9c1\ud06c'], headers=_hdrs, timeout=10)
+            soup = BeautifulSoup(html, 'html.parser')
             td = soup.select_one('td.img_td')
             item['\uc0ac\uc5c5\uac1c\uc694'] = td.get_text(separator='\n', strip=True) if td else "\ub0b4\uc6a9 \uc5c6\uc74c"
         except Exception as e:
@@ -2195,10 +2289,10 @@ def crawl_cbtp_list(end_page=3):
     for page in range(1, end_page + 1):
         try:
             url = base_url.format(page)
-            response = session.get(url, headers=headers)
-            response.encoding = 'EUC-KR' # Force encoding
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
+            # CBTP는 DESAdapter(레거시 SSL) + EUC-KR 강제. session 명시 시 fetch_html은
+            # Scrapling을 건너뛰고 이 session으로만 요청 → DH_KEY_TOO_SMALL 회피.
+            html = fetch_html(url, session=session, headers=headers, encoding='EUC-KR', timeout=20)
+            soup = BeautifulSoup(html, 'html.parser')
             
             rows = soup.select('table tbody tr')
             if not rows:
@@ -2313,13 +2407,13 @@ def crawl_jbtp_list(end_page=3):
             print(f"  {page}페이지 크롤링 중...")
             # cpath param for pagination
             url = f"https://www.jbtp.or.kr/index.jbtp?menuCd=DOM_000000102001000000&cpath={page}"
-            
-            response = GLOBAL_SESSION.get(url, timeout=10)
-            if response.status_code != 200:
-                print(f"    [오류] 페이지 로드 실패: {response.status_code}")
+
+            try:
+                html = fetch_html(url, timeout=10)
+            except Exception as e:
+                print(f"    [오류] 페이지 로드 실패: {e}")
                 continue
-                
-            soup = BeautifulSoup(response.text, 'html.parser')
+            soup = BeautifulSoup(html, 'html.parser')
             rows = soup.select('table tbody tr')
             print(f"    {len(rows)}개 항목 검사...")
             
@@ -2394,13 +2488,13 @@ def crawl_jntp_list(end_page=3):
         try:
             print(f"  {page}페이지 크롤링 중...")
             url = f"https://www.jntp.or.kr/base/apiAnnouncement/List?page={page}"
-            
-            response = GLOBAL_SESSION.get(url, headers=headers, timeout=10)
-            if response.status_code != 200:
-                print(f"    [오류] 페이지 로드 실패: {response.status_code}")
+
+            try:
+                html = fetch_html(url, headers=headers, timeout=10)
+            except Exception as e:
+                print(f"    [오류] 페이지 로드 실패: {e}")
                 continue
-                
-            soup = BeautifulSoup(response.text, 'html.parser')
+            soup = BeautifulSoup(html, 'html.parser')
             rows = soup.select('table tbody tr')
             print(f"    {len(rows)}개 항목 검사...")
             
@@ -2463,10 +2557,11 @@ def crawl_jntp_details(data_list):
 
     def _fetch(item):
         try:
-            r = GLOBAL_SESSION.get(item['링크'], headers=_hdrs, timeout=10)
-            if r.status_code != 200:
+            try:
+                html = fetch_html(item['링크'], headers=_hdrs, timeout=10)
+            except Exception:
                 return item
-            soup = BeautifulSoup(r.text, 'html.parser')
+            soup = BeautifulSoup(html, 'html.parser')
             overview_parts = []
             for li in soup.select('div.annou-content div.tbl-content ul li'):
                 for span in li.find_all('span', class_='txt'):
@@ -2515,13 +2610,13 @@ def crawl_gbtp_list(end_page=3):
         try:
             print(f"  {page}페이지 크롤링 중...")
             url = f"https://www.gbtp.or.kr/user/board.do?bbsId=BBSMSTR_000000000021&pageIndex={page}"
-            
-            response = GLOBAL_SESSION.get(url, headers=headers, timeout=10)
-            if response.status_code != 200:
-                print(f"    [오류] 페이지 로드 실패: {response.status_code}")
+
+            try:
+                html = fetch_html(url, headers=headers, timeout=10)
+            except Exception as e:
+                print(f"    [오류] 페이지 로드 실패: {e}")
                 continue
-                
-            soup = BeautifulSoup(response.text, 'html.parser')
+            soup = BeautifulSoup(html, 'html.parser')
             rows = soup.select('table tbody tr')
             print(f"    {len(rows)}개 항목 검사...")
             
@@ -2601,13 +2696,13 @@ def crawl_ptp_list(end_page=3):
         try:
             print(f"  {page}페이지 크롤링 중...")
             url = f"https://www.ptp.or.kr/main/board/index.do?menu_idx=116&manage_idx=15&pageIndex={page}"
-            
-            response = GLOBAL_SESSION.get(url, headers=headers, timeout=10)
-            if response.status_code != 200:
-                print(f"    [오류] 페이지 로드 실패: {response.status_code}")
+
+            try:
+                html = fetch_html(url, headers=headers, timeout=10)
+            except Exception as e:
+                print(f"    [오류] 페이지 로드 실패: {e}")
                 continue
-                
-            soup = BeautifulSoup(response.text, 'html.parser')
+            soup = BeautifulSoup(html, 'html.parser')
             rows = soup.select('table tbody tr')
             print(f"    {len(rows)}개 항목 검사...")
             
@@ -2700,13 +2795,13 @@ def crawl_gntp_list(end_page=3):
             # 페이지네이션은 JavaScript 기반이지만, 첫 페이지 데이터는 정적 HTML에 포함됨
             # 추가 페이지는 API 호출 또는 Selenium 필요할 수 있음
             url = f"https://www.gntp.or.kr/biz/apply?page={page}"
-            
-            response = GLOBAL_SESSION.get(url, headers=headers, timeout=10)
-            if response.status_code != 200:
-                print(f"    [오류] 페이지 로드 실패: {response.status_code}")
+
+            try:
+                html = fetch_html(url, headers=headers, timeout=10)
+            except Exception as e:
+                print(f"    [오류] 페이지 로드 실패: {e}")
                 continue
-                
-            soup = BeautifulSoup(response.text, 'html.parser')
+            soup = BeautifulSoup(html, 'html.parser')
             
             # 데스크탑 테이블 찾기: div.de-news table
             table = soup.select_one('div.de-news table')
@@ -2888,10 +2983,9 @@ def crawl_ctp_list(end_page=3):
     for page in range(1, end_page + 1):
         try:
             url = base_url.format(page)
-            # CTP는 일반 requests로 가능 (SSL verify=False)
-            response = GLOBAL_SESSION.get(url, headers=headers)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
+            # CTP는 일반 requests로 가능 (SSL verify=False) — fetch_html이 Scrapling 우선 시도
+            html = fetch_html(url, headers=headers, timeout=20)
+            soup = BeautifulSoup(html, 'html.parser')
             
             rows = soup.select('table tbody tr')
             if not rows:
@@ -3291,8 +3385,8 @@ def main():
             print(f"[오류] {name} 크롤링 실패: {e}")
             return []
 
-    print("\n[병렬] requests 기반 크롤러 동시 실행 시작...")
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    print(f"\n[병렬] requests 기반 크롤러 동시 실행 시작... (workers={PHASE2_WORKERS})")
+    with ThreadPoolExecutor(max_workers=PHASE2_WORKERS) as ex:
         futures_map = {
             ex.submit(_run_requests_crawler, "대전테크노파크",   crawl_djtp_list, None,              END_PAGE): "대전TP",
             ex.submit(_run_requests_crawler, "세종테크노파크",   crawl_sjtp_list, None,              END_PAGE): "세종TP",
