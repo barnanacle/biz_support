@@ -134,6 +134,29 @@ def fetch_html(url, *, session=None, timeout=20, params=None, headers=None,
         r.encoding = r.apparent_encoding or r.encoding
     return r.text
 
+
+def fetch_bytes(url, *, params=None, timeout=30, headers=None):
+    """바이너리 콘텐츠(엑셀/PDF 등)를 받기 위한 fetcher.
+
+    fetch_html은 text(str)를 반환하므로 xlsx 같은 바이너리에는 부적합.
+    Scrapling Fetcher(TLS 스푸핑) 우선 시도 후 GLOBAL_SESSION으로 fallback.
+    두 경로 모두 bytes를 반환한다.
+    """
+    final_url = _merge_url_params(url, params)
+    if _SCRAPLING_FETCHER is not None:
+        try:
+            page = _SCRAPLING_FETCHER.get(final_url, timeout=timeout,
+                                          **({'headers': headers} if headers else {}))
+            body = getattr(page, 'body', None)
+            if isinstance(body, (bytes, bytearray)) and len(body) > 1000:
+                return bytes(body)
+        except Exception:
+            pass  # 조용히 fallback
+    r = GLOBAL_SESSION.get(final_url, headers=headers, timeout=timeout, verify=False)
+    r.raise_for_status()
+    return r.content
+
+
 # SSL Adapter for legacy servers (DH_KEY_TOO_SMALL)
 class DESAdapter(requests.adapters.HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False):
@@ -156,6 +179,22 @@ class DESAdapter(requests.adapters.HTTPAdapter):
 START_PAGE = 1
 END_PAGE = 10          # jiwon 계열 크롤러 기본 페이지 수
 SBIZ24_END_PAGE = 85   # 소상공인24 크롤링 페이지 수
+
+# ── 비즈인포(기업마당) 신 시스템(selectSIIA200) 대응 설정 ─────────────────
+# 2026년 기업마당이 구 게시판(/web/lay1/bbs/S1T122C128)에서 신 시스템으로 전환.
+# 구 URL은 302 리다이렉트되고, '최신 등록순 150건'만 긁던 기존 방식은 K-뷰티론
+# 정책자금처럼 '예산 소진시까지' 오래 열려있는 인기 공고를 통째로 누락시켰다.
+# → 엑셀 일괄 다운로드(selectSIIA200ExcelDownload.do)로 전체 목록을 받아
+#   '현재 신청 가능 + 직접지원성 핵심 분야'만 필터링해 누락을 근본적으로 없앤다.
+BIZINFO_EXCEL_URL = "https://www.bizinfo.go.kr/sii/siia/selectSIIA200ExcelDownload.do"
+# 직접지원성 핵심 분야(~700건). 노이즈 비중 큰 경영/인력/내수/기타는 제외.
+# 수집 범위를 넓히려면 '경영','인력','내수' 등을 추가하면 됨.
+BIZINFO_INCLUDE_FIELDS = {'금융', '기술', '수출', '창업'}
+# 단순 안내/결과 발표성 공고 제외 (사업 기회가 아님)
+BIZINFO_NOISE_RE = re.compile(
+    r'선정\s*결과|결과\s*발표|모집\s*결과|평가\s*결과|설명회|간담회|안내문|'
+    r'연기\s*공고|변경\s*공고|재공고\s*안내'
+)
 
 def setup_driver():
     chrome_options = Options()
@@ -806,154 +845,144 @@ def crawl_generic_details(items, max_workers=4, ctx=None):
         return list(ex.map(_one, items))
 
 
-def crawl_bizinfo_list(driver):
-    print(f"비즈인포(bizinfo.go.kr) 목록 크롤링 시작 (페이지 {START_PAGE} ~ {END_PAGE})...")
+def _bizinfo_extract_summary(soup):
+    """비즈인포 신 상세페이지(selectSIIA200Detail)에서 '사업개요' 추출.
+
+    구조: div.view_cont > ul > li 안에 span.s_title('사업개요') + div.txt.
+    requests로 받은 정적 HTML에서 그대로 추출된다 (Selenium 불필요).
+    """
+    vc = soup.find(class_='view_cont')
+    if not vc:
+        return ""
+    for li in vc.find_all('li'):
+        st = li.find(class_='s_title')
+        if st and '사업개요' in st.get_text():
+            txt = li.find(class_='txt')
+            if txt:
+                return txt.get_text(' ', strip=True)
+    return ""
+
+
+def _load_existing_summaries():
+    """기존 data.json에서 링크→사업개요 캐시 로드 (점진적 보강용).
+
+    이미 충분히 긴 사업개요가 있는 링크는 다음 실행에서 재크롤링하지 않고
+    그대로 재사용 → 매일 신규 공고만 상세 fetch 하므로 런타임이 안정적이다.
+    placeholder/짧은 값은 캐시하지 않아 다음에 다시 시도된다.
+    """
+    path = os.path.join(os.path.dirname(__file__), 'biz_support_web', 'data.json')
+    cache = {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            for it in json.load(f).get('data', []):
+                link = (it.get('링크') or '').strip()
+                summ = (it.get('사업개요') or '').strip()
+                if (link and len(summ) >= 80 and
+                        not any(p in summ for p in ('추출 실패', '크롤링 오류',
+                                                    '링크 없음', '내용 없음'))):
+                    cache[link] = summ
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    except Exception:
+        pass
+    return cache
+
+
+def _format_period(start, end):
+    """엑셀의 신청시작/종료일자 → 카드 신청기간 문자열."""
+    s = (str(start).strip() if start else '')
+    e = (str(end).strip() if end else '')
+    if s and e:
+        return f"{s} ~ {e}"
+    if e:
+        return f"~ {e}"
+    if s:
+        return f"{s} ~"
+    return "상시"
+
+
+def crawl_bizinfo_list(driver=None):
+    """비즈인포(기업마당) 전체 공고를 엑셀 일괄 다운로드로 수집.
+
+    신 시스템(selectSIIA200) 전환 대응 + '최신 N건만' 누락 문제 해결:
+      1) selectSIIA200ExcelDownload.do 로 전체 목록(구조화 데이터) 1회 수신
+      2) 신청종료일자 >= 오늘  → 현재 신청 가능한 공고만 (예산소진형 장기공고 포함)
+      3) 지원분야 ∈ BIZINFO_INCLUDE_FIELDS → 직접지원성 핵심 분야만
+      4) 단순 안내/결과 발표성 제목 제외
+    driver 인자는 하위호환용(미사용). 상세 사업개요는 main()에서 requests로 보강.
+    """
+    import openpyxl  # 무거운 의존성 → 함수 내부 import
+    print("비즈인포(기업마당) 엑셀 일괄 수집 시작...")
+    try:
+        content = fetch_bytes(BIZINFO_EXCEL_URL, params={'rows': 15, 'cpage': 1}, timeout=40)
+        # read_only=True는 이 xlsx의 dimension 메타데이터 부재로 1행만 인식 → 미사용.
+        # 파일이 작아(~110KB) 일반 로드해도 부담 없음.
+        wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+    except Exception as e:
+        print(f"[비즈인포] 엑셀 수집 실패 → 빈 결과 반환: {e}")
+        return []
+
+    if not rows or len(rows) < 2:
+        print("[비즈인포] 엑셀에 데이터가 없습니다.")
+        return []
+
+    # 헤더 기반 컬럼 매핑 (열 순서 변동 대비)
+    header = [str(h).strip() if h else '' for h in rows[0]]
+    def col(*names, default=None):
+        for n in names:
+            if n in header:
+                return header.index(n)
+        return default
+    i_title = col('공고명', '지원사업명', default=4)
+    i_field = col('지원분야', '분야', default=3)
+    i_start = col('신청시작일자', default=5)
+    i_end   = col('신청종료일자', default=6)
+    i_url   = col('공고상세URL', 'URL', default=8)
+
+    today = datetime.now().date()
     all_data = []
-    
-    base_url = "https://www.bizinfo.go.kr/web/lay1/bbs/S1T122C128/AS/74/list.do?rows=15&cpage={}"
-    
-    for page in range(START_PAGE, END_PAGE + 1):
-        url = base_url.format(page)
-        print(f"\n--- 페이지 {page} 크롤링 중: {url} ---")
-        
-        try:
-            driver.get(url)
-            # 테이블 로딩 대기
-            WebDriverWait(driver, 8).until(
-                EC.presence_of_element_located((By.CLASS_NAME, "table_Type_1"))
-            )
-            time.sleep(0.3)
-            
-            # BeautifulSoup으로 파싱 (목록은 정적 파싱이 빠름)
-            soup = BeautifulSoup(driver.page_source, 'html.parser')
-            table_div = soup.find('div', class_='table_Type_1')
-            
-            if not table_div:
-                print("테이블을 찾을 수 없습니다.")
-                continue
-                
-            rows = table_div.find_all('tr')
-            
-            page_items = 0
-            for row in rows:
-                cols = row.find_all('td')
-                if len(cols) >= 5: # 번호, 지원분야, 사업명, 접수기간, 기관명 등
-                    # 사업명 및 링크 (3번째 컬럼, 인덱스 2)
-                    title_col = cols[2]
-                    link_tag = title_col.find('a')
-                    
-                    if link_tag:
-                        title = link_tag.text.strip()
-                        href = link_tag.get('href')
-                        # href가 상대경로일 경우 처리
-                        # 예: view.do?pblancId=... 또는 /web/lay1/bbs/...
-                        if href.startswith('/'):
-                            link = f"https://www.bizinfo.go.kr{href}"
-                        else:
-                            # view.do... 형태인 경우
-                            link = f"https://www.bizinfo.go.kr/web/lay1/bbs/S1T122C128/AS/74/{href}"
-                            
-                        # 접수기간 (4번째 컬럼, 인덱스 3)
-                        period = cols[3].text.strip()
-                        
-                        row_data = {
-                            '지원사업명': title,
-                            '신청기간': period,
-                            '링크': link,
-                            '사업개요': '' # 상세 크롤링 전 빈 값
-                        }
-                        all_data.append(row_data)
-                        page_items += 1
-            
-            print(f"페이지 {page}에서 {page_items}개의 항목을 찾았습니다.")
-            
-        except Exception as e:
-            print(f"페이지 {page} 처리 중 오류 발생: {e}")
-            
-    return all_data
-
-def crawl_bizinfo_details(driver, data):
-    print(f"\n상세 내용('사업개요') 크롤링 시작 (총 {len(data)}개 항목)...")
-    
-    # 드라이버 재시작 주기
-    RESTART_INTERVAL = 50
-    
-    for i, item in enumerate(data):
-        # 주기적 재시작
-        if i > 0 and i % RESTART_INTERVAL == 0:
-            print(f"--- 드라이버 재시작 (메모리 관리, {i}/{len(data)}) ---")
-            try:
-                driver.quit()
-            except:
-                pass
-            driver = setup_driver()
-            
-        link = item.get('링크')
-        if not link or "javascript" in link: # 유효하지 않은 링크 건너뛰기
-            item['사업개요'] = "링크 오류"
+    skipped_closed = skipped_field = skipped_noise = 0
+    for r in rows[1:]:
+        if not r or len(r) <= max(i_title, i_url, i_field, i_end):
             continue
-            
-        print(f"[{i+1}/{len(data)}] 상세 크롤링 중: {item['지원사업명'][:20]}...")
-        
-        try:
-            driver.get(link)
-            # 페이지 로딩 대기 (view_cont가 나타날 때까지)
-            try:
-                WebDriverWait(driver, 7).until(
-                    EC.presence_of_element_located((By.CLASS_NAME, "view_cont"))
-                )
-            except:
-                print("  - view_cont 요소를 찾을 수 없음 (Timeout)")
-            
-            time.sleep(0.4)  # 추가 대기
-            
-            content = ""
-            
-            # 방법 1: view_cont 내부의 li를 순회하며 '사업개요' 찾기 (가장 확실함)
-            try:
-                view_cont = driver.find_element(By.CLASS_NAME, "view_cont")
-                lis = view_cont.find_elements(By.TAG_NAME, "li")
-                
-                for li in lis:
-                    try:
-                        title_span = li.find_element(By.CLASS_NAME, "s_title")
-                        if "사업개요" in title_span.text:
-                            txt_div = li.find_element(By.CLASS_NAME, "txt")
-                            content = txt_div.text.strip()
-                            break
-                    except:
-                        continue
-            except Exception as e:
-                print(f"  - 리스트 순회 중 오류: {e}")
+        title = (str(r[i_title]).strip() if r[i_title] else '')
+        url   = (str(r[i_url]).strip() if r[i_url] else '')
+        field = (str(r[i_field]).strip() if r[i_field] else '')
+        if not title or not url:
+            continue
 
-            # 방법 2: XPath Fallback
-            if not content:
-                try:
-                    content_div = driver.find_element(By.XPATH, "//span[@class='s_title'][contains(text(), '사업개요')]/following-sibling::div[@class='txt']")
-                    content = content_div.text.strip()
-                except:
-                    pass
-            
-            if not content:
-                content = "내용 없음 (추출 실패)"
-                
-            item['사업개요'] = content
-            
-        except Exception as e:
-            print(f"상세 크롤링 중 치명적 오류 발생: {e}")
-            item['사업개요'] = "크롤링 오류"
-            
-            # 세션 오류 시 재시작
-            if "invalid session id" in str(e):
-                try:
-                    driver.quit()
-                except:
-                    pass
-                driver = setup_driver()
-                
-        time.sleep(0.2)  # 부하 방지
-        
-    return data, driver
+        # (2) 현재 신청 가능 필터: 종료일 파싱되면 오늘 이후만, 파싱 실패 시 포함(보수적)
+        end_date = None
+        try:
+            end_date = datetime.strptime(str(r[i_end])[:10], '%Y-%m-%d').date()
+        except Exception:
+            end_date = None
+        if end_date is not None and end_date < today:
+            skipped_closed += 1
+            continue
+
+        # (3) 핵심 분야 필터
+        if BIZINFO_INCLUDE_FIELDS and field not in BIZINFO_INCLUDE_FIELDS:
+            skipped_field += 1
+            continue
+
+        # (4) 노이즈 제목 제외
+        if BIZINFO_NOISE_RE.search(title):
+            skipped_noise += 1
+            continue
+
+        all_data.append({
+            '지원사업명': title,
+            '신청기간': _format_period(r[i_start], r[i_end]),
+            '링크': url,
+            '사업개요': '',
+        })
+
+    print(f"[비즈인포] 엑셀 {len(rows)-1}건 중 수집 {len(all_data)}건 "
+          f"(마감제외 {skipped_closed} / 분야제외 {skipped_field} / 노이즈제외 {skipped_noise})")
+    return all_data
 
 
 def crawl_btp_list(driver):
@@ -3279,27 +3308,31 @@ def main():
     driver = None
 
 
-    # 1. 기업마당 (BizInfo)
+    # 1. 기업마당 (BizInfo) — 엑셀 일괄 수집 + requests 점진적 상세 보강 (Selenium 미사용)
     try:
-        # driver는 setup_driver()에서 한 번만 초기화하고 재사용
-        driver = setup_driver() # Initial driver setup
-        bizinfo_list = crawl_bizinfo_list(driver) # Pass driver to list crawler
+        bizinfo_list = crawl_bizinfo_list()  # 엑셀 다운로드 → 신청가능+핵심분야 필터
         if bizinfo_list:
-            # 상세 페이지 크롤링 (Selenium 사용) - driver 반환 받음
-            bizinfo_details, driver = crawl_bizinfo_details(driver, bizinfo_list) # Pass driver first
-            # 출처 추가
-            for item in bizinfo_details: # Ensure '출처' is added to detailed items
+            # 점진적 보강: 기존 data.json의 사업개요를 미리 채워두면
+            # enrich_detail()이 '≥80자면 skip' 규칙으로 신규 공고만 fetch 한다.
+            summary_cache = _load_existing_summaries()
+            cached_hits = 0
+            for it in bizinfo_list:
+                c = summary_cache.get((it.get('링크') or '').strip())
+                if c:
+                    it['사업개요'] = c
+                    cached_hits += 1
+            print(f"[비즈인포] 사업개요 캐시 재사용 {cached_hits}건 / 신규 fetch 대상 "
+                  f"{len(bizinfo_list) - cached_hits}건")
+            # 신 상세페이지는 정적 HTML → requests 병렬로 사업개요 보강 (Selenium 불필요)
+            bizinfo_list = crawl_generic_details(
+                bizinfo_list, max_workers=PHASE2_WORKERS,
+                ctx={'html_processor': _bizinfo_extract_summary})
+            for item in bizinfo_list:
                 item['출처'] = '비즈인포'
-            final_results.extend(bizinfo_details)
+            final_results.extend(bizinfo_list)
+            print(f"[비즈인포] 최종 {len(bizinfo_list)}건 수집 완료")
     except Exception as e:
-        # print(f"[오류] 기업마당 크롤링 실패: {e}")
-        # If BizInfo fails and driver might be broken, try to re-initialize for next steps
-        try:
-            if driver:
-                driver.quit()
-            driver = setup_driver()
-        except:
-            driver = None
+        print(f"[오류] 기업마당 크롤링 실패: {e}")
 
     # 2. 부산테크노파크 (BTP)
     try:
