@@ -909,6 +909,51 @@ def _format_period(start, end):
     return "상시"
 
 
+def _load_prev_bizinfo_items():
+    """비즈인포 엑셀 수집 실패 시, 직전 data.json의 비즈인포 항목 중
+    아직 마감되지 않은 것을 보존용으로 반환한다.
+
+    비즈인포는 전체 수집량의 ~70%를 차지하는 단일 대형 출처다. GitHub Actions
+    러너 IP가 차단돼 엑셀(selectSIIA200ExcelDownload.do)을 못 받으면 그날 전체가
+    sanity 가드(전체 70% 미만 거부)에 걸려 TP 사이트 신규 공고까지 통째로
+    누락된다. 직전 비즈인포 데이터(미마감)를 유지하면 항목 수가 보존돼 가드를
+    통과하고, TP 사이트는 정상 갱신되며, 비즈인포는 차단 해제 시 자동 최신화된다.
+
+    반환 항목은 이미 '출처'='비즈인포'로 태깅돼 있어 main()이 보존 분기를
+    식별하고 상세 보강(차단된 서버 재접속)을 건너뛴다.
+    """
+    web_data_path = os.path.join(os.path.dirname(__file__), 'biz_support_web', 'data.json')
+    try:
+        with open(web_data_path, 'r', encoding='utf-8') as f:
+            prev = json.load(f).get('data', [])
+    except (FileNotFoundError, json.JSONDecodeError):
+        print("[비즈인포] 보존할 이전 data.json 없음 → 빈 결과")
+        return []
+
+    today = datetime.now().date()
+    preserved, dropped = [], 0
+    for it in prev:
+        if it.get('출처') != '비즈인포':
+            continue
+        # 신청기간 "YYYY-MM-DD ~ YYYY-MM-DD"의 종료일로 마감 판별. 파싱 실패 시 보존(보수적).
+        end_str = str(it.get('신청기간', '')).split('~')[-1].strip()[:10]
+        try:
+            if datetime.strptime(end_str, '%Y-%m-%d').date() < today:
+                dropped += 1
+                continue
+        except Exception:
+            pass
+        preserved.append({
+            '지원사업명': it.get('지원사업명', ''),
+            '신청기간': it.get('신청기간', ''),
+            '링크': it.get('링크', ''),
+            '사업개요': it.get('사업개요', ''),
+            '출처': '비즈인포',
+        })
+    print(f"[비즈인포] 이전 데이터 보존: {len(preserved)}건 (마감 제외 {dropped}건)")
+    return preserved
+
+
 def crawl_bizinfo_list(driver=None):
     """비즈인포(기업마당) 전체 공고를 엑셀 일괄 다운로드로 수집.
 
@@ -929,8 +974,8 @@ def crawl_bizinfo_list(driver=None):
         ws = wb.active
         rows = list(ws.iter_rows(values_only=True))
     except Exception as e:
-        print(f"[비즈인포] 엑셀 수집 실패 → 빈 결과 반환: {e}")
-        return []
+        print(f"[비즈인포] 엑셀 수집 실패 → 이전 data.json 비즈인포 항목 보존 시도: {e}")
+        return _load_prev_bizinfo_items()
 
     if not rows or len(rows) < 2:
         print("[비즈인포] 엑셀에 데이터가 없습니다.")
@@ -3319,7 +3364,16 @@ def main():
     # 1. 기업마당 (BizInfo) — 엑셀 일괄 수집 + requests 점진적 상세 보강 (Selenium 미사용)
     try:
         bizinfo_list = crawl_bizinfo_list()  # 엑셀 다운로드 → 신청가능+핵심분야 필터
-        if bizinfo_list:
+        # 엑셀 수집 실패 시 crawl_bizinfo_list가 이전 data.json의 비즈인포 항목(미마감,
+        # '출처'='비즈인포' 이미 태깅됨)을 보존 반환한다. 정상 수집 항목엔 '출처'가 아직
+        # 없으므로 이걸로 보존 분기를 식별한다. 보존 항목을 enrich에 다시 보내면 차단된
+        # bizinfo.go.kr에 재접속해 무의미한 timeout이 누적되므로 상세 보강을 건너뛴다.
+        bizinfo_preserved = bool(bizinfo_list) and all(
+            it.get('출처') == '비즈인포' for it in bizinfo_list)
+        if bizinfo_preserved:
+            final_results.extend(bizinfo_list)
+            print(f"[비즈인포] 엑셀 수집 실패 → 이전 데이터 {len(bizinfo_list)}건 보존 (상세 보강 생략)")
+        elif bizinfo_list:
             # 점진적 보강: 기존 data.json의 사업개요를 미리 채워두면
             # enrich_detail()이 '≥80자면 skip' 규칙으로 신규 공고만 fetch 한다.
             summary_cache = _load_existing_summaries()
