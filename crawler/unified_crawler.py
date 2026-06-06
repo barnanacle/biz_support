@@ -94,7 +94,12 @@ def fetch_html(url, *, session=None, timeout=20, params=None, headers=None,
     # 1) Scrapling Fetcher 시도 — 단, 명시 session이 없을 때만
     if session is None and allow_scrapling and _SCRAPLING_FETCHER is not None:
         try:
-            kwargs = {'timeout': timeout}
+            # verify=False: requests 경로(GLOBAL_SESSION.verify=False)와 동일 정책.
+            # 한국 공공기관 다수가 중간 CA를 누락한 불완전 인증서 체인을 제공 →
+            # Scrapling(curl_cffi) 기본 verify=True면 curl(60) "unable to get local
+            # issuer certificate"로 실패하고 내부 재시도·requests 폴백 지연이 누적된다.
+            # 검증을 끄면 Scrapling 경로가 1차에 성공 → 수집 성공률·속도 동시 개선.
+            kwargs = {'timeout': timeout, 'verify': False}
             try:
                 # 지원하지 않는 버전이면 TypeError로 빠지고 fallback
                 kwargs['impersonate'] = 'chrome120'
@@ -145,7 +150,10 @@ def fetch_bytes(url, *, params=None, timeout=30, headers=None):
     final_url = _merge_url_params(url, params)
     if _SCRAPLING_FETCHER is not None:
         try:
-            page = _SCRAPLING_FETCHER.get(final_url, timeout=timeout,
+            # verify=False: fetch_html과 동일 — 공공기관 불완전 인증서 체인 대응.
+            # 비즈인포 엑셀 등 바이너리 fetch가 curl(60) SSL 실패로 빈 결과를 반환하던
+            # 문제를 막는다(Scrapling TLS 스푸핑 경로를 실제로 활용 → 차단·타임아웃 완화).
+            page = _SCRAPLING_FETCHER.get(final_url, timeout=timeout, verify=False,
                                           **({'headers': headers} if headers else {}))
             body = getattr(page, 'body', None)
             if isinstance(body, (bytes, bytearray)) and len(body) > 1000:
