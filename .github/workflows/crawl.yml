@@ -23,16 +23,16 @@ jobs:
 
     steps:
       - name: 레포 체크아웃
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Python 3.11 설정
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'
 
       - name: Chrome 설치
-        uses: browser-actions/setup-chrome@v1
+        uses: browser-actions/setup-chrome@v2
         with:
           chrome-version: 'stable'
 
