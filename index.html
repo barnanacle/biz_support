@@ -711,30 +711,6 @@
            + RANK_W_APP * app;
     }
 
-    function overviewQuality(item) {
-      const clean = (item['사업개요'] || '').replace(/[\u200b]/g, '').trim();
-      if (!clean) return 0;
-      if (/^내용\s*없음|^크롤링\s*오류|내용\s*추출\s*실패|^링크\s*오류/.test(clean)) return 0;
-      const len = clean.length;
-      if (len >= 200) return 2;
-      if (len >= 80) return 1;
-      return 0;
-    }
-
-    function periodInfo(period) {
-      const clean = (period || '').replace(/\n/g, ' ').trim();
-      if (!clean) return { bucket: -1, days: -9999, expired: false };
-      if (isUnlimited(clean)) return { bucket: 4, days: 9999, expired: false };
-      const end = parseEndDate(clean);
-      if (!end) return { bucket: -1, days: -9999, expired: false };
-      const days = Math.round((end - TODAY) / 86400000);
-      if (days < 0) return { bucket: -1, days, expired: true };
-      if (days >= 30) return { bucket: 3, days, expired: false };
-      if (days >= 14) return { bucket: 2, days, expired: false };
-      if (days >= 7)  return { bucket: 1, days, expired: false };
-      return { bucket: 0, days, expired: false };
-    }
-
     // 추천 비교: 가중합 score 내림차순. |Δscore|<band 동률은 세션시드 셔플(로테이션 보존).
     function compareRecommend(a, b) {
       const sa = recommendScore(a), sb = recommendScore(b);
@@ -845,27 +821,6 @@
     function isFresh(item) {
       return item.first_seen === TODAY_STR;
     }
-
-    // 추천 요건 충족 여부 (신규 카드 pin 판단용)
-    function meetsTopCriteria(item) {
-      const p = periodInfo(item['신청기간']);
-      if (p.expired) return false;
-      // 직접지원 or 상세 개요 or 충분한 기간
-      if (directSupportScore(item['지원사업명']) >= 1) return true;
-      if (overviewQuality(item) >= 1) return true;
-      if (p.bucket >= 2) return true;
-      return false;
-    }
-
-    /**
-     * 추천 정렬 + 새로고침 로테이션
-     *   1) 오늘 first_seen + 요건 충족 = '신규 우수 카드' → 최상단 pin
-     *   2) 그 다음 상위 SHUFFLE_SIZE개는 세션 시드 해시로 셔플
-     *      (새로고침마다 SHUFFLE_SEED 재생성 → 매번 상단 카드 순서 변경)
-     *   3) 이후는 추천 스코어 순으로 유지
-     *   4) 만료된 카드는 항상 최하단
-     */
-    const SHUFFLE_SIZE = 40;  // 상위 몇 개를 셔플할지 (30~50 범위)
 
     // 추천순: 만료(score<0) 분리 → alive를 가중합 score로 정렬(동률은 세션시드 셔플)
     // → 다양성 후처리 → 만료를 최하단에 부착. exact-today fresh-pin은 폐기(0건 사망 문제).

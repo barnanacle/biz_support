@@ -1173,9 +1173,6 @@ DIRECT_SUPPORT_KEYWORDS_MID = (
     '시설지원', '장비', '공간지원', '판로', '마케팅', '해외진출',
     '수출', '특허', '지재권', '시제품', '시작품', '스케일업',
 )
-BAD_OVERVIEW_PATTERNS = ('내용 없음', '크롤링 오류', '내용 추출 실패', '링크 오류')
-UNLIMITED_PATTERNS = ('예산 소진', '소진시까지', '소진 시까지', '예산소진')
-
 # ── 추천 정렬 가중치 (index.html의 동일 상수와 1:1 동기화 필수) ───────────
 # 기존 5단 사전식 정렬은 상위 동률군에서 최하위 '남은일수 많은순'으로 떨어져
 # 연말(12-31) 장기공고를 상단 독식시켰다. 이를 해소하기 위해 (A)최신성·
@@ -1212,53 +1209,6 @@ def _direct_support_score(name, overview=''):
         if kw in overview:
             return 0.4
     return 0.0
-
-
-def _overview_quality(overview: str) -> int:
-    """사업개요 상세도. 2=상세(≥200자), 1=간단(≥80자), 0=없음/비정상"""
-    clean = (overview or '').replace('\u200b', '').strip()
-    if not clean:
-        return 0
-    head = clean[:40]
-    if any(bad in head for bad in BAD_OVERVIEW_PATTERNS):
-        return 0
-    length = len(clean)
-    if length >= 200:
-        return 2
-    if length >= 80:
-        return 1
-    return 0
-
-
-def _period_score(period: str, today=None):
-    """신청기간 여유 평가.
-    반환: (bucket, days_left, is_expired)
-      bucket: 4=예산소진 · 3=30일↑ · 2=14일↑ · 1=7일↑ · 0=0일↑ · -1=마감/미상
-    """
-    period = (period or '').replace('\n', ' ').strip()
-    if not period:
-        return (-1, -9999, False)
-    if any(k in period for k in UNLIMITED_PATTERNS):
-        return (4, 9999, False)
-    today = today or datetime.now().date()
-    dates = re.findall(r'(\d{4})[-./](\d{1,2})[-./](\d{1,2})', period)
-    if not dates:
-        return (-1, -9999, False)
-    y, m, d = dates[-1]
-    try:
-        end_date = datetime(int(y), int(m), int(d)).date()
-    except ValueError:
-        return (-1, -9999, False)
-    days = (end_date - today).days
-    if days < 0:
-        return (-1, days, True)
-    if days >= 30:
-        return (3, days, False)
-    if days >= 14:
-        return (2, days, False)
-    if days >= 7:
-        return (1, days, False)
-    return (0, days, False)
 
 
 def _parse_first_date(period):
