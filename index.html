@@ -644,15 +644,71 @@
       '수출', '특허', '지재권', '시제품', '시작품', '스케일업'
     ];
 
-    function directSupportScore(name) {
-      if (!name) return 0;
-      for (const kw of DIRECT_SUPPORT_KEYWORDS_HIGH) {
-        if (name.includes(kw)) return 2;
+    // ── 추천 정렬 가중치 (unified_crawler.py의 동일 상수와 1:1 동기화 필수) ──
+    const RANK_HALF_LIFE_DAYS = 14;
+    const RANK_W_REC = 0.45, RANK_W_DIR = 0.30, RANK_W_APP = 0.25;
+    const RANK_RECENCY_FLOOR = 0.15;
+    const RANK_APP_NONE = 0.30;
+    const RANK_APP_LONG_TAIL = 0.50;
+    const RANK_TIE_BAND = 0.01;
+    const RANK_DIV_NAME_PREFIX = 16;
+    const RANK_DIV_MAX_RUN = 2;
+
+    function parseStartDate(period) {
+      if (!period) return null;
+      const m = period.replace(/\n/g, ' ').match(/(\d{4})[-./](\d{1,2})[-./](\d{1,2})/);
+      if (!m) return null;
+      const d = new Date(+m[1], +m[2] - 1, +m[3]);
+      return isNaN(d) ? null : d;
+    }
+
+    // 직접 재정지원 강도(연속값 0~1.0): 제목+개요 통합 스캔.
+    // 1.0=제목 HIGH, 0.85=본문만 HIGH(제목 누락 회수), 0.5=제목 MID, 0.4=본문 MID, 0=불명.
+    function directSupportScore(name, overview) {
+      name = name || ''; overview = overview || '';
+      for (const kw of DIRECT_SUPPORT_KEYWORDS_HIGH) if (name.includes(kw)) return 1.0;
+      for (const kw of DIRECT_SUPPORT_KEYWORDS_HIGH) if (overview.includes(kw)) return 0.85;
+      for (const kw of DIRECT_SUPPORT_KEYWORDS_MID) if (name.includes(kw)) return 0.5;
+      for (const kw of DIRECT_SUPPORT_KEYWORDS_MID) if (overview.includes(kw)) return 0.4;
+      return 0.0;
+    }
+
+    // 최신성(A): 접수 시작일·first_seen 중 더 최근 기준 지수감쇠. 미래 시작일은 제외.
+    function recencyScore(item) {
+      const cands = [];
+      const start = parseStartDate(item['신청기간']);
+      if (start && start <= TODAY) cands.push(start.getTime());
+      const fsRaw = String(item.first_seen || '').slice(0, 10).split('-').map(Number);
+      if (fsRaw.length === 3 && !isNaN(fsRaw[0])) {
+        const fs = new Date(fsRaw[0], fsRaw[1] - 1, fsRaw[2]);
+        if (!isNaN(fs)) cands.push(fs.getTime());
       }
-      for (const kw of DIRECT_SUPPORT_KEYWORDS_MID) {
-        if (name.includes(kw)) return 1;
-      }
-      return 0;
+      let eff;
+      if (!cands.length) eff = 30;
+      else eff = Math.max(0, Math.round((TODAY.getTime() - Math.max(...cands)) / 86400000));
+      return Math.max(RANK_RECENCY_FLOOR, Math.exp(-eff / RANK_HALF_LIFE_DAYS));
+    }
+
+    // 신청가능성(B): 마감 여유로 근사(plateau형). <0=만료(최하단 신호).
+    function applicabilityScore(period) {
+      const dl = daysLeft(period);
+      if (dl === null) return RANK_APP_NONE;
+      if (dl < 0) return -1.0;
+      if (dl < 3) return 0.55;
+      if (dl < 7) return 0.80;
+      if (dl <= 45) return 1.00;
+      if (dl <= 90) return 0.85;
+      if (dl <= 180) return 0.65;
+      return RANK_APP_LONG_TAIL;
+    }
+
+    // 가중합 추천 점수. 만료는 -1(최하단).
+    function recommendScore(item) {
+      const app = applicabilityScore(item['신청기간']);
+      if (app < 0) return -1;
+      return RANK_W_REC * recencyScore(item)
+           + RANK_W_DIR * directSupportScore(item['지원사업명'], item['사업개요'])
+           + RANK_W_APP * app;
     }
 
     function overviewQuality(item) {
@@ -679,25 +735,44 @@
       return { bucket: 0, days, expired: false };
     }
 
+    // 추천 비교: 가중합 score 내림차순. |Δscore|<band 동률은 세션시드 셔플(로테이션 보존).
     function compareRecommend(a, b) {
-      const pa = periodInfo(a['신청기간']);
-      const pb = periodInfo(b['신청기간']);
-      // 1) 마감된 항목은 하단
-      if (pa.expired !== pb.expired) return pa.expired ? 1 : -1;
-      // 2) 직접 지원 점수 (금전/바우처 등) 높은 순
-      const sa = directSupportScore(a['지원사업명']);
-      const sb = directSupportScore(b['지원사업명']);
-      if (sa !== sb) return sb - sa;
-      // 3) 사업개요 상세도 높은 순
-      const qa = overviewQuality(a);
-      const qb = overviewQuality(b);
-      if (qa !== qb) return qb - qa;
-      // 4) 신청기간 여유 버킷 높은 순
-      if (pa.bucket !== pb.bucket) return pb.bucket - pa.bucket;
-      // 5) 남은 일수 많은 순
-      if (pa.days !== pb.days) return pb.days - pa.days;
-      // 6) 동일 우선순위 내에서는 세션 시드 기반 셔플 (새로고침마다 순서 변경)
-      return hashStr(a['지원사업명'] || '', SHUFFLE_SEED) - hashStr(b['지원사업명'] || '', SHUFFLE_SEED);
+      const sa = recommendScore(a), sb = recommendScore(b);
+      if (Math.abs(sa - sb) >= RANK_TIE_BAND) return sb - sa;
+      return hashStr(a['링크'] || a['지원사업명'] || '', SHUFFLE_SEED)
+           - hashStr(b['링크'] || b['지원사업명'] || '', SHUFFLE_SEED);
+    }
+
+    // 다양성 판정용 사업명 정규화: 선행 [지역]·(지역)·연도·공백 제거 후 prefix.
+    function normalizeName(name) {
+      let s = (name || '').replace(/^\s*[\[\(][^\]\)]*[\]\)]\s*/, '');
+      s = s.replace(/20\d{2}\s*년?/g, '');
+      s = s.replace(/\s+/g, '');
+      return s.slice(0, RANK_DIV_NAME_PREFIX);
+    }
+
+    // 다양성 후처리(백엔드 _diversify와 동일): 동일 사업명 중복 demote + 같은 출처 연속 억제.
+    function diversify(items) {
+      const seen = {}, primary = [], demoted = [];
+      for (const it of items) {
+        const key = normalizeName(it['지원사업명']);
+        if (key && (seen[key] || 0) >= 1) demoted.push(it);
+        else { seen[key] = (seen[key] || 0) + 1; primary.push(it); }
+      }
+      const spread = [], pool = primary.slice();
+      while (pool.length) {
+        let placed = false;
+        for (let i = 0; i < pool.length; i++) {
+          const src = pool[i]['출처'] || '';
+          let run = 0;
+          for (let j = spread.length - 1; j >= 0; j--) {
+            if ((spread[j]['출처'] || '') === src) run++; else break;
+          }
+          if (run < RANK_DIV_MAX_RUN) { spread.push(pool.splice(i, 1)[0]); placed = true; break; }
+        }
+        if (!placed) spread.push(pool.shift());
+      }
+      return spread.concat(demoted);
     }
 
     // ── Shuffle Seed (새로고침마다 재생성 → 매 세션 상단 로테이션) ──
@@ -792,43 +867,22 @@
      */
     const SHUFFLE_SIZE = 40;  // 상위 몇 개를 셔플할지 (30~50 범위)
 
+    // 추천순: 만료(score<0) 분리 → alive를 가중합 score로 정렬(동률은 세션시드 셔플)
+    // → 다양성 후처리 → 만료를 최하단에 부착. exact-today fresh-pin은 폐기(0건 사망 문제).
     function getRecommended(arr) {
-      // 0단계: 만료 카드 분리
       const alive = [];
       const expired = [];
       arr.forEach(it => {
-        if (periodInfo(it['신청기간']).expired) expired.push(it);
+        if (recommendScore(it) < 0) expired.push(it);
         else alive.push(it);
       });
-      expired.sort(compareRecommend);
-
-      // 1단계: alive를 추천 스코어로 정렬
       alive.sort(compareRecommend);
-
-      // 2단계: 신규 & 요건 충족 카드 → 최상단 pin
-      const freshPinned = [];
-      const rest = [];
-      alive.forEach(it => {
-        if (isFresh(it) && meetsTopCriteria(it)) freshPinned.push(it);
-        else rest.push(it);
+      // 만료는 마감일 늦은 순 결정론 정렬(백엔드 _sort_key의 (1,-ordinal)과 일치, 셔플 배제).
+      expired.sort((a, b) => {
+        const ea = parseEndDate(a['신청기간']), eb = parseEndDate(b['신청기간']);
+        return (eb ? eb.getTime() : 0) - (ea ? ea.getTime() : 0);
       });
-      // 신규 pin도 추천 스코어 순 유지
-      freshPinned.sort(compareRecommend);
-
-      // 3단계: rest의 상위 SHUFFLE_SIZE개를 세션 시드 셔플
-      //         (신규가 많으면 셔플 영역은 그만큼 줄여 상단이 과밀해지는 것 방지)
-      const shuffleSize = Math.max(20, SHUFFLE_SIZE - freshPinned.length);
-      const shuffleable = rest.slice(0, shuffleSize);
-      const tail = rest.slice(shuffleSize);
-
-      // 세션 시드 기반 해시 정렬 (렌더 중에는 안정, 새로고침 시마다 재배치)
-      shuffleable.sort((a, b) => {
-        const ka = a['링크'] || a['지원사업명'] || '';
-        const kb = b['링크'] || b['지원사업명'] || '';
-        return hashStr(ka, SHUFFLE_SEED) - hashStr(kb, SHUFFLE_SEED);
-      });
-
-      return [...freshPinned, ...shuffleable, ...tail, ...expired];
+      return [...diversify(alive), ...expired];
     }
 
     // ── Filter ───────────────────────────────────────
@@ -886,12 +940,12 @@
 
       const isChecked = getCheckedSet().has(link);
 
-      // 직접 지원 뱃지 (지원사업명 기반)
-      const supportLv = directSupportScore(item['지원사업명']);
+      // 직접 지원 뱃지 (지원사업명+사업개요 기반). 0.85↑=직접 재정지원, 0.4↑=간접 프로그램
+      const supportLv = directSupportScore(item['지원사업명'], item['사업개요']);
       let supportBadge = '';
-      if (supportLv === 2) {
-        supportBadge = `<span class="badge badge-support" title="지원사업명에 자금·바우처·보조금 등 직접 지원 키워드 포함">💰 직접지원</span>`;
-      } else if (supportLv === 1) {
+      if (supportLv >= 0.85) {
+        supportBadge = `<span class="badge badge-support" title="자금·바우처·보조금 등 직접 재정지원">💰 직접지원</span>`;
+      } else if (supportLv >= 0.4) {
         supportBadge = `<span class="badge badge-support-mid" title="R&D·컨설팅·판로 등 간접 혜택">🛠️ 프로그램</span>`;
       }
 

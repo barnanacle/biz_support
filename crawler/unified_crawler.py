@@ -5,6 +5,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from bs4 import BeautifulSoup
 import time
 from datetime import datetime, timedelta
+import math
 import json
 import re
 import io
@@ -1175,18 +1176,42 @@ DIRECT_SUPPORT_KEYWORDS_MID = (
 BAD_OVERVIEW_PATTERNS = ('내용 없음', '크롤링 오류', '내용 추출 실패', '링크 오류')
 UNLIMITED_PATTERNS = ('예산 소진', '소진시까지', '소진 시까지', '예산소진')
 
+# ── 추천 정렬 가중치 (index.html의 동일 상수와 1:1 동기화 필수) ───────────
+# 기존 5단 사전식 정렬은 상위 동률군에서 최하위 '남은일수 많은순'으로 떨어져
+# 연말(12-31) 장기공고를 상단 독식시켰다. 이를 해소하기 위해 (A)최신성·
+# (C)기업실익·(B)신청가능성의 가중합 score로 전환한다.
+RANK_HALF_LIFE_DAYS = 14    # recency 지수감쇠 반감기(일)
+RANK_W_REC = 0.45           # 최신성 가중 (A)
+RANK_W_DIR = 0.30           # 직접 재정지원(기업실익) 가중 (C)
+RANK_W_APP = 0.25           # 신청가능성(예산잔여 프록시+마감균형) 가중 (B)
+RANK_RECENCY_FLOOR = 0.15   # recency 최소값(오래된 공고도 0은 아님)
+RANK_APP_NONE = 0.30        # 신청기간 미상 시 applicability
+RANK_APP_LONG_TAIL = 0.50   # 마감 >180일(연말 장기공고) 캡 → 쏠림 억제
+RANK_TIE_BAND = 0.01        # |Δscore| 이 값 미만이면 동률로 보고 셔플
+RANK_DIV_NAME_PREFIX = 16   # 다양성: 동일 사업명 판정용 정규화 prefix 길이
+RANK_DIV_MAX_RUN = 2        # 다양성: 같은 출처 연속 최대 허용 개수
 
-def _direct_support_score(name: str) -> int:
-    """지원사업명으로 추정한 직접 지원 정도. 2=재정/바우처, 1=간접혜택, 0=불명"""
-    if not name:
-        return 0
+
+def _direct_support_score(name, overview=''):
+    """지원사업명+사업개요로 추정한 직접 지원 강도(연속값 0~1.0).
+    1.0=제목에 재정/바우처 키워드, 0.85=본문에만(제목 누락분 회수, 신뢰도↓),
+    0.5=제목 간접혜택(MID), 0.4=본문 간접, 0.0=불명.
+    """
+    name = name or ''
+    overview = overview or ''
     for kw in DIRECT_SUPPORT_KEYWORDS_HIGH:
         if kw in name:
-            return 2
+            return 1.0
+    for kw in DIRECT_SUPPORT_KEYWORDS_HIGH:
+        if kw in overview:
+            return 0.85
     for kw in DIRECT_SUPPORT_KEYWORDS_MID:
         if kw in name:
-            return 1
-    return 0
+            return 0.5
+    for kw in DIRECT_SUPPORT_KEYWORDS_MID:
+        if kw in overview:
+            return 0.4
+    return 0.0
 
 
 def _overview_quality(overview: str) -> int:
@@ -1236,30 +1261,125 @@ def _period_score(period: str, today=None):
     return (0, days, False)
 
 
-def _sort_key(item):
-    """
-    추천 정렬 기준 (ascending 정렬 → 스코어 음수화):
-      0) 마감된 항목은 무조건 하단
-      1) 지원사업명에 '직접 지원(자금·보조금·바우처 등)' 포함 여부
-      2) 사업개요 상세도 (길이 기반)
-      3) 신청기간 여유 버킷 (예산소진 > 30일↑ > 14일↑ > 7일↑)
-      4) 실제 남은 일수 (동일 버킷 내에서 여유 많은 카드 우선)
-    """
-    name     = (item.get('지원사업명') or '').strip()
-    overview = item.get('사업개요') or ''
-    period   = item.get('신청기간') or ''
+def _parse_first_date(period):
+    """신청기간 첫 날짜(접수 시작일) 파싱. 없으면 None."""
+    m = re.search(r'(\d{4})[-./](\d{1,2})[-./](\d{1,2})', period or '')
+    if not m:
+        return None
+    try:
+        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
+    except ValueError:
+        return None
 
-    support_score  = _direct_support_score(name)
-    overview_score = _overview_quality(overview)
-    bucket, days_left, is_expired = _period_score(period)
 
-    return (
-        1 if is_expired else 0,   # 마감 → 하단
-        -support_score,           # 직접 지원 강도
-        -overview_score,          # 사업개요 상세도
-        -bucket,                  # 신청기간 여유 버킷
-        -days_left,               # 남은 일수
-    )
+def _parse_last_date(period):
+    """신청기간 마지막 날짜(마감일) 파싱. 없으면 None."""
+    dates = re.findall(r'(\d{4})[-./](\d{1,2})[-./](\d{1,2})', period or '')
+    if not dates:
+        return None
+    y, m, d = dates[-1]
+    try:
+        return datetime(int(y), int(m), int(d)).date()
+    except ValueError:
+        return None
+
+
+def _recency_score(item, today):
+    """최신성(A): 접수 시작일·first_seen 중 더 최근을 기준으로 지수감쇠.
+    first_seen이 백필로 저해상도라 고해상도인 신청 시작일과 max로 결합.
+    미래 시작일(아직 접수전)은 신선 가산에서 제외하고 first_seen만 사용.
+    """
+    cands = []
+    start = _parse_first_date(item.get('신청기간') or '')
+    if start is not None and start <= today:
+        cands.append(start)
+    fs = (item.get('first_seen') or '')[:10]
+    try:
+        cands.append(datetime.strptime(fs, '%Y-%m-%d').date())
+    except (ValueError, TypeError):
+        pass
+    eff_age = 30 if not cands else max(0, (today - max(cands)).days)
+    return max(RANK_RECENCY_FLOOR, math.exp(-eff_age / RANK_HALF_LIFE_DAYS))
+
+
+def _applicability_score(period, today):
+    """신청가능성(B): 마감까지 여유로 근사(예산잔여 직접신호 부재).
+    plateau형 — 너무 임박/너무 장기 양쪽 감점, >180일은 캡. 만료는 -1.0(최하단 신호).
+    """
+    end = _parse_last_date(period)
+    if end is None:
+        return RANK_APP_NONE
+    dl = (end - today).days
+    if dl < 0:
+        return -1.0
+    if dl < 3:
+        return 0.55
+    if dl < 7:
+        return 0.80
+    if dl <= 45:
+        return 1.00
+    if dl <= 90:
+        return 0.85
+    if dl <= 180:
+        return 0.65
+    return RANK_APP_LONG_TAIL
+
+
+def _sort_key(item, today=None):
+    """추천 정렬 키. 가중합 score 기반(정렬 ascending → score 음수화).
+    만료(applicability<0)는 항상 최하단(마감 늦은 순).
+    """
+    today = today or datetime.now().date()
+    period = item.get('신청기간') or ''
+    app = _applicability_score(period, today)
+    if app < 0:
+        end = _parse_last_date(period)
+        return (1, -(end.toordinal() if end else 0))
+    rec = _recency_score(item, today)
+    direct = _direct_support_score(item.get('지원사업명') or '', item.get('사업개요') or '')
+    score = RANK_W_REC * rec + RANK_W_DIR * direct + RANK_W_APP * app
+    return (0, -score)
+
+
+def _normalize_name(name):
+    """다양성 판정용 사업명 정규화: 선행 [지역]·연도·공백 제거 후 prefix."""
+    s = re.sub(r'^\s*[\[\(][^\]\)]*[\]\)]\s*', '', name or '')
+    s = re.sub(r'20\d{2}\s*년?', '', s)
+    s = re.sub(r'\s+', '', s)
+    return s[:RANK_DIV_NAME_PREFIX]
+
+
+def _diversify(items):
+    """score 정렬된 리스트에 다양성 후처리(결정론적, 프론트와 동일 구현):
+      (1) 동일 사업명(정규화) 중복은 첫 1개만 상위, 나머지는 후순위로.
+      (2) 같은 출처가 연속 RANK_DIV_MAX_RUN 초과하지 않게 그리디 재배치.
+    """
+    seen, primary, demoted = {}, [], []
+    for it in items:
+        key = _normalize_name(it.get('지원사업명') or '')
+        if key and seen.get(key, 0) >= 1:
+            demoted.append(it)
+        else:
+            seen[key] = seen.get(key, 0) + 1
+            primary.append(it)
+    spread, pool = [], list(primary)
+    while pool:
+        placed = False
+        for i, it in enumerate(pool):
+            src = it.get('출처') or ''
+            run = 0
+            for prev in reversed(spread):
+                if (prev.get('출처') or '') == src:
+                    run += 1
+                else:
+                    break
+            if run < RANK_DIV_MAX_RUN:
+                spread.append(pool.pop(i))
+                placed = True
+                break
+        if not placed:
+            spread.append(pool.pop(0))
+    return spread + demoted
 
 def save_to_web_json(data):
     """크롤링 결과를 웹 뷰어용 data.json에만 저장.
@@ -1318,7 +1438,19 @@ def save_to_web_json(data):
     print(f"[first_seen] 신규 {new_count}개 / 기존 {len(data) - new_count}개")
 
     # 정렬 적용
-    sorted_data = sorted(data, key=_sort_key)
+    _today = datetime.now().date()
+    # 프론트 getRecommended와 동일 구조: 만료/생존 분리 → 생존만 다양성 후처리 →
+    # 만료(마감 늦은 순)를 최하단에 부착. 만료 포함 전체에 _diversify를 적용하면
+    # demote된 생존 중복이 만료 아래로 가라앉아 화면(프론트)·디스크 순서가 어긋난다.
+    _alive, _expired = [], []
+    for _it in data:
+        if _applicability_score(_it.get('신청기간') or '', _today) < 0:
+            _expired.append(_it)
+        else:
+            _alive.append(_it)
+    _alive.sort(key=lambda it: _sort_key(it, _today))
+    _expired.sort(key=lambda it: _sort_key(it, _today))
+    sorted_data = _diversify(_alive) + _expired
 
     # 웹 뷰어 데이터 덮어쓰기 (last_updated 메타데이터 포함)
     try:
