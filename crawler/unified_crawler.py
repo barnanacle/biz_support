@@ -949,6 +949,7 @@ def _load_prev_bizinfo_items():
             '신청기간': it.get('신청기간', ''),
             '링크': it.get('링크', ''),
             '사업개요': it.get('사업개요', ''),
+            '등록일자': it.get('등록일자', ''),
             '출처': '비즈인포',
         })
     print(f"[비즈인포] 이전 데이터 보존: {len(preserved)}건 (마감 제외 {dropped}건)")
@@ -994,6 +995,7 @@ def crawl_bizinfo_list(driver=None):
     i_start = col('신청시작일자', default=5)
     i_end   = col('신청종료일자', default=6)
     i_url   = col('공고상세URL', 'URL', default=8)
+    i_reg   = col('등록일자', default=7)  # 공고 (재)등록일 — 추천 정렬 recency 신호
 
     today = datetime.now().date()
     all_data = []
@@ -1032,6 +1034,7 @@ def crawl_bizinfo_list(driver=None):
             '신청기간': _format_period(r[i_start], r[i_end]),
             '링크': url,
             '사업개요': '',
+            '등록일자': (str(r[i_reg])[:10] if len(r) > i_reg and r[i_reg] else ''),
         })
 
     print(f"[비즈인포] 엑셀 {len(rows)-1}건 중 수집 {len(all_data)}건 "
@@ -1235,19 +1238,25 @@ def _parse_last_date(period):
 
 
 def _recency_score(item, today):
-    """최신성(A): 접수 시작일·first_seen 중 더 최근을 기준으로 지수감쇠.
-    first_seen이 백필로 저해상도라 고해상도인 신청 시작일과 max로 결합.
-    미래 시작일(아직 접수전)은 신선 가산에서 제외하고 first_seen만 사용.
+    """최신성(A): 등록일자(비즈인포 공고 (재)등록일)·접수 시작일·first_seen 중
+    가장 최근 날짜 기준 지수감쇠 (index.html effectiveAgeDays/recencyScore와 동일).
+    등록일자는 비즈인포가 부여하는 실제 등록일. 신규 수집 항목은 first_seen이
+    등록일자보다 항상 늦거나 같아(공고는 등록 후 수집됨) 효과가 없고, 기존 공고가
+    수정공고로 in-place 재등록될 때(등록일자만 갱신, first_seen은 과거 보존)
+    '신선'으로 복권된다 — 효과는 크롤 누적 후 나타나는 관측형 신호.
+    미래 날짜는 신선 가산에서 제외하고, 후보가 없으면 30일로 간주.
     """
     cands = []
     start = _parse_first_date(item.get('신청기간') or '')
     if start is not None and start <= today:
         cands.append(start)
-    fs = (item.get('first_seen') or '')[:10]
-    try:
-        cands.append(datetime.strptime(fs, '%Y-%m-%d').date())
-    except (ValueError, TypeError):
-        pass
+    for raw in (item.get('first_seen'), item.get('등록일자')):
+        try:
+            d = datetime.strptime(str(raw or '')[:10], '%Y-%m-%d').date()
+        except (ValueError, TypeError):
+            continue
+        if d <= today:
+            cands.append(d)
     eff_age = 30 if not cands else max(0, (today - max(cands)).days)
     return max(RANK_RECENCY_FLOOR, math.exp(-eff_age / RANK_HALF_LIFE_DAYS))
 

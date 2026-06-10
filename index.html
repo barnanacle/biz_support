@@ -673,20 +673,28 @@
       return 0.0;
     }
 
-    // 최신성(A): 접수 시작일·first_seen 중 더 최근 기준 지수감쇠. 미래 시작일은 제외.
-    function recencyScore(item) {
+    // 유효 신선도(일): 등록일자(비즈인포 공고 (재)등록일)·접수시작일·first_seen 중
+    // 가장 최근 날짜 기준 (백엔드 _recency_score와 동일 후보). 등록일자는 기존 공고가
+    // 수정공고로 재등록될 때 '신선'으로 복권시키는 관측형 신호(신규 항목은 first_seen이
+    // 항상 같거나 늦어 무영향). 미래 날짜 제외, 없으면 30일.
+    function effectiveAgeDays(item) {
       const cands = [];
       const start = parseStartDate(item['신청기간']);
       if (start && start <= TODAY) cands.push(start.getTime());
-      const fsRaw = String(item.first_seen || '').slice(0, 10).split('-').map(Number);
-      if (fsRaw.length === 3 && !isNaN(fsRaw[0])) {
-        const fs = new Date(fsRaw[0], fsRaw[1] - 1, fsRaw[2]);
-        if (!isNaN(fs)) cands.push(fs.getTime());
+      for (const raw of [item.first_seen, item['등록일자']]) {
+        const p = String(raw || '').slice(0, 10).split('-').map(Number);
+        if (p.length === 3 && !isNaN(p[0]) && !isNaN(p[1]) && !isNaN(p[2])) {
+          const d = new Date(p[0], p[1] - 1, p[2]);
+          if (!isNaN(d) && d <= TODAY) cands.push(d.getTime());
+        }
       }
-      let eff;
-      if (!cands.length) eff = 30;
-      else eff = Math.max(0, Math.round((TODAY.getTime() - Math.max(...cands)) / 86400000));
-      return Math.max(RANK_RECENCY_FLOOR, Math.exp(-eff / RANK_HALF_LIFE_DAYS));
+      if (!cands.length) return 30;
+      return Math.max(0, Math.round((TODAY.getTime() - Math.max(...cands)) / 86400000));
+    }
+
+    // 최신성(A): 유효 신선도의 지수감쇠.
+    function recencyScore(item) {
+      return Math.max(RANK_RECENCY_FLOOR, Math.exp(-effectiveAgeDays(item) / RANK_HALF_LIFE_DAYS));
     }
 
     // 신청가능성(B): 마감 여유로 근사(plateau형). <0=만료(최하단 신호).
@@ -809,17 +817,10 @@
       return clone;
     }
 
-    // ── 오늘 날짜 (first_seen 비교용) ─────────────────
-    function todayYmd() {
-      const t = new Date();
-      const mm = String(t.getMonth() + 1).padStart(2, '0');
-      const dd = String(t.getDate()).padStart(2, '0');
-      return `${t.getFullYear()}-${mm}-${dd}`;
-    }
-    const TODAY_STR = todayYmd();
-
+    // 신규 카드 판정: 유효 신선도(등록일자·접수시작일·first_seen 중 최신) 1일 이내.
+    // 구 exact-today(first_seen===오늘) 비교는 크롤 다음날부터 0건이 되는 문제로 폐기.
     function isFresh(item) {
-      return item.first_seen === TODAY_STR;
+      return effectiveAgeDays(item) <= 1;
     }
 
     // 추천순: 만료(score<0) 분리 → alive를 가중합 score로 정렬(동률은 세션시드 셔플)
@@ -904,9 +905,9 @@
         supportBadge = `<span class="badge badge-support-mid" title="R&D·컨설팅·판로 등 간접 혜택">🛠️ 프로그램</span>`;
       }
 
-      // 신규(오늘 처음 발견) 뱃지
+      // 신규(최근 1일 내 등록·발견) 뱃지
       const newBadge = isFresh(item)
-        ? `<span class="badge badge-new" title="오늘 크롤링에서 새로 발견된 카드">🆕 신규</span>`
+        ? `<span class="badge badge-new" title="최근 1일 내 등록·발견된 신규 공고">🆕 신규</span>`
         : '';
 
       return `
