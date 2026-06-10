@@ -39,6 +39,13 @@ GLOBAL_SESSION.headers.update({
 MAX_WORKERS = 5
 PHASE2_WORKERS = 12  # Phase 2 requests 병렬 worker (Scrapling 도입 후 8 → 12 상향)
 
+# ── 핵심정보(첨부 공고문 구조화 추출) 설정 ─────────────────────────
+# 첨부 다운로드는 비즈인포 단일 도메인이라 PHASE2_WORKERS(12) 투입 금지 — 전용 4.
+KEYINFO_VERSION = 1            # 추출 스키마 버전 — 로직 개선 시 bump → 통제된 재백필
+EXTRACT_CAP = int(os.environ.get('EXTRACT_CAP', '200'))        # run당 첨부 보강 상한
+EXTRACT_DEADLINE_SEC = int(os.environ.get('EXTRACT_DEADLINE_SEC', '600'))
+EXTRACT_WORKERS = 4
+
 # ────────────────────────────────────────────────────────────────────
 # Scrapling Fetcher (curl_cffi 기반 TLS fingerprint spoofing + HTTP/2)
 # ────────────────────────────────────────────────────────────────────
@@ -358,7 +365,9 @@ def find_attachment_links(soup, base_url=""):
         onclick = (a.get('onclick') or '').strip()
         text = a.get_text(' ', strip=True)
         # 형제/상위 텍스트 (파일명이 인접 노드에 표시되는 경우)
-        ancestor_texts = [text]
+        # + a@title/@download — 비즈인포는 텍스트='다운로드'·title='첨부파일 xxx.pdf 다운로드'
+        #   구조라 title을 안 읽으면 0건 반환(라이브 실증).
+        ancestor_texts = [text, a.get('title') or '', a.get('download') or '']
         cur = a.parent
         for _ in range(3):
             if cur is None:
@@ -738,6 +747,626 @@ def summarize_long_text(text, max_len=500):
     return _trim_summary(body, max_len=max_len)
 
 
+# ════════════════════════════════════════════════════════════════════
+# 핵심정보 추출 엔진 — 공고 텍스트(첨부 전문/사업개요)에서 구조화 필드 마이닝
+# ════════════════════════════════════════════════════════════════════
+# 설계: 패턴 마이닝(B) 골격 + 섹션 헤더 가드(A) 병합. 실측 84~92% 정밀도 기반.
+# 모든 마이너는 개별 try/except 격리 — extract_key_fields는 절대 raise하지 않는다.
+
+_KI_HANJA_MAP = {'社': '사', '員': '원', '當': '당'}
+_KI_CJK_RUN = re.compile(r'[一-鿿]+')
+
+
+def _ki_clean_text(text):
+    """HWP mojibake(CJK run)·PDF 윤곽선체 중복문자·NBSP 정리."""
+    if not text:
+        return ''
+    for h, k in _KI_HANJA_MAP.items():
+        text = text.replace(h, k)
+    text = _KI_CJK_RUN.sub(' ', text)
+    text = re.sub(r'(.)\1{4,}', r'\1', text)
+    text = text.replace('\xa0', ' ')
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    # 복합 금액 정규화: '1억4천만원'→'14,000만원' (단일 단위 regex가 절단 오인하는 것 방지)
+    text = re.sub(
+        r'(\d{1,3})\s*억\s*(\d{1,4})\s*천만\s*원',
+        lambda m: format(int(m.group(1)) * 10000 + int(m.group(2)) * 1000, ',') + '만원',
+        text)
+    return text
+
+
+_KI_NUM = r'\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?'
+_KI_MONEY = re.compile(
+    rf'({_KI_NUM})\s*(억\s*원|천만\s*원|백만\s*원|십만\s*원|만\s*원|천\s*원|억(?![가-힣])|원)')
+_KI_MULT = {'억원': 1e8, '억': 1e8, '천만원': 1e7, '백만원': 1e6,
+            '십만원': 1e5, '만원': 1e4, '천원': 1e3, '원': 1}
+_KI_RATE = re.compile(r'(\d{1,3})\s*%\s*(?:이내|까지|한도)?\s*(?:를?\s*)?(지원|보조|국비|감면|환급)')
+_KI_PER = re.compile(r'(기업\s*당|개사\s*당|업체\s*당|과제\s*당|팀\s*당|건\s*당|[1l]?\s*인\s*당|1?\s*사\s*당|명\s*당|기관\s*당)')
+_KI_QUAL = re.compile(r'(최대|한도|이내|내외|까지|상한|限)')
+_KI_AMOUNT_LABEL = re.compile(
+    r'(지원\s*금액|지원\s*규모|지원\s*한도|지원\s*단가|총\s*사업비|보조금|지원액|융자|대출\s*한도|보증\s*한도|바우처)')
+_KI_AMOUNT_NEG = re.compile(r'(누적\s*투자|투자\s*실적|투자액|투자\s*유치|매출|자본금|수출\s*실적|출자|보증\s*잔액)')
+
+_KI_SCALE = re.compile(
+    r'(?:총\s*)?(\d{1,4})\s*(개\s*사|개사|개\s*기업|개\s*업체|개\s*과제|개\s*팀|개\s*기관|개소|명|팀|건)'
+    r'(?:\s*(내외|이내|미만))?')
+_KI_SCALE_CTX = re.compile(r'(모집|선정|선발|규모|인원|기업\s*수|업체\s*수|채용|지원\s*기업)')
+
+_KI_PHONE = re.compile(r'(?<!\d)(0\d{1,2})[-.)]\s?(\d{3,4})[-.]\s?(\d{4})(?!\d)')
+_KI_HOTLINE = re.compile(r'(?:국번\s*없이\s*|☎\s*)(1\d{3})(?:-(\d{4}))?(?!\d)')
+_KI_ORG = re.compile(
+    r'([가-힣A-Za-z()（）·&\s]{2,28}?(?:팀|센터|진흥원|재단|공사|공단|본부|지원단|사업단|'
+    r'협회|연구원|연구소|대학|사무국|테크노파크|상공회의소|진흥회|진흥공단|[가-힣]{1,6}과))')
+
+_KI_ELIG_LABEL = re.compile(
+    r'(지원\s*대상|신청\s*자격|지원\s*자격|신청\s*대상|모집\s*대상|모집\s*요건|'
+    r'참가\s*자격|참여\s*자격|참가\s*대상|참여\s*대상|모집\s*기업|지원\s*요건)')
+_KI_CUT = re.compile(
+    r'(지원\s*내용|지원\s*규모|신청\s*기간|사업\s*기간|접수\s*기간|신청\s*방법|'
+    r'지원\s*조건|제외\s*대상|[❍◦○□■▶]|\n\s*[-–•*]|\n\s*\d\s*[.)])')
+_KI_ELIG_KW = re.compile(
+    r'(중소기업|소상공인|중견기업|창업기업|예비\s*창업|스타트업|업력|매출|소재|'
+    r'관내|도내|시내|영위|종사|개인사업자|법인|기업|기관)')
+_KI_TAG_REGION = re.compile(
+    r'([가-힣]{2,8}(?:특별시|광역시|시|도|군|구))\s*(?:소재|관내|내\s*소재|지역)|(도내|관내|시내|지역\s*내)')
+_KI_TAG_YEARS = re.compile(r'(?:창업|업력|설립)\s*(?:후\s*)?(\d{1,2})\s*년\s*(이내|미만|이하|이상|초과)')
+_KI_TAG_SALES = re.compile(rf'매출(?:액)?\s*(?:이\s*)?({_KI_NUM})\s*(억|백만|천만)?\s*원?\s*(이상|이하|미만|초과)?')
+
+_KI_APPLY_LABEL = re.compile(
+    r'(신청\s*방법|접수\s*방법|신청\s*및\s*접수|접수\s*및\s*신청|신청\s*[·∙/]\s*접수|접수처|신청\s*절차)')
+_KI_EMAIL = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+_KI_URL = re.compile(r'(?:https?://)?(?:www\.)?[A-Za-z0-9][A-Za-z0-9.-]+\.(?:go|or|co|re)\.kr(?:/[^\s"\'\)<>]*)?')
+_KI_SYSTEMS = re.compile(
+    r'(SMTECH|스마트공장\s*1번가|K-?[Ss]tartup|케이스타트업|기업마당|소상공인\s*24|'
+    r'IRIS|범부처통합연구지원시스템|이지비즈|ezbiz|RIPC|정부24|나라장터|e나라도움|보조금24)', re.I)
+_KI_CH_PATTERNS = [
+    ('온라인', re.compile(r'온라인\s*(?:신청|접수|제출)?|홈페이지(?:를\s*통해|에서)|누리집|시스템.{0,8}(?:신청|접수|등록|입력)')),
+    ('이메일', re.compile(r'이메일|전자\s*우편|e-?mail', re.I)),
+    ('방문', re.compile(r'방문\s*(?:접수|제출|신청)')),
+    ('우편', re.compile(r'우편\s*(?:접수|제출|송부)')),
+    ('팩스', re.compile(r'팩스\s*(?:접수|제출)')),
+]
+_KI_CONTENT_LABEL = re.compile(r'(지원\s*내용|지원\s*사항|지원\s*프로그램|지원\s*항목|사업\s*내용)')
+_KI_CONTACT_LABEL = re.compile(r'(문의처|연락처|문\s*의)')
+_KI_HOMETAX_BLOCK = re.compile(r'hometax\.go\.kr|nts\.go\.kr', re.I)
+
+_KI_JOSA = ('을', '를', '이', '가', '은', '는', '의', '에', '으로', '로', '과', '와', '도', '만')
+# 필드 캡(자): 합산 최악 ~820자 ≈ 2.5KB/건
+_KI_FIELD_CAPS = {'지원금액': 60, '지원금액_총': 40, '선정규모': 40, '지원대상': 150,
+                  '지원내용': 250, '신청방법': 100, '문의처': 100}
+
+
+def _ki_cap(s, n):
+    s = (s or '').strip()
+    return s if len(s) <= n else s[:n - 1].rstrip() + '…'
+
+
+def _ki_fmt_krw(v):
+    if v >= 1e8:
+        s = f'{v / 1e8:.2f}'.rstrip('0').rstrip('.')
+        return s + '억원'
+    if v >= 1e4:
+        return format(int(round(v / 1e4)), ',') + '만원'
+    return format(int(v), ',') + '원'
+
+
+def _ki_is_header_shaped(text, start, end, strict=True):
+    """라벨 매치가 '섹션 헤더 모양'인지 판정 (심판 필수수정 — mid-sentence 함정 차단).
+    (a) 직전 문자가 한글 음절이면 단어 중간 매칭, (b) 직후 토큰이 조사면 본문 문장,
+    (c) strict: 같은 물리행 잔여가 콜론/대시 시작 또는 ≤12자일 때만 헤더 인정.
+    """
+    if start > 0 and '가' <= text[start - 1] <= '힣':
+        return False
+    rest = text[end:end + 16].lstrip(' \t')
+    if rest and any(rest.startswith(j) for j in _KI_JOSA):
+        return False
+    # (b') 직후가 '명사+조사' 꼴이면 본문 문장 — '지원 대상 여부를 판단…' 함정 차단.
+    # (c)를 개요에 적용하면 한 줄 흐름 텍스트의 정상 라벨까지 차단(실측 대상 27%→36% 회복).
+    if rest and re.match(r'^[가-힣]{1,4}(?:을|를|이|가|은|는)(?:\s|$)', rest):
+        return False
+    if strict:
+        nl = text.find('\n', end)
+        line_rest = text[end:nl if nl != -1 else end + 40].strip()
+        if line_rest and not (line_rest[0] in ':：)-–—]' or len(line_rest) <= 12):
+            return False
+    return True
+
+
+_KI_SECTION_LABELS = (
+    ('지원대상', _KI_ELIG_LABEL),
+    ('지원내용', _KI_CONTENT_LABEL),
+    ('신청방법', _KI_APPLY_LABEL),
+    ('문의처', _KI_CONTACT_LABEL),
+    ('지원규모', re.compile(r'(지원\s*규모|사업\s*규모|선정\s*규모)')),
+)
+
+
+def _ki_split_sections(text, strict=True):
+    """{섹션명: (start, end)} — 헤더모양 가드 통과 매치만 헤더로 인정, 본문 최대 600자."""
+    heads = []
+    for name, rx in _KI_SECTION_LABELS:
+        for m in rx.finditer(text):
+            if _ki_is_header_shaped(text, m.start(), m.end(), strict=strict):
+                heads.append((m.start(), m.end(), name))
+                break
+    heads.sort()
+    out = {}
+    for i, (s, e, name) in enumerate(heads):
+        nxt = heads[i + 1][0] if i + 1 < len(heads) else len(text)
+        out[name] = (e, min(nxt, e + 600))
+    return out
+
+
+def _ki_label_window(text, label_re, width=170, strict=True):
+    """라벨 직후 본문 윈도우 추출 (헤더모양 가드 적용)."""
+    for m in label_re.finditer(text):
+        if not _ki_is_header_shaped(text, m.start(), m.end(), strict=strict):
+            continue
+        chunk = text[m.end():m.end() + width + 40]
+        chunk = re.sub(r'^[\s):：\-\]]+', '', chunk)
+        cut = _KI_CUT.search(chunk, 8)
+        if cut:
+            chunk = chunk[:cut.start()]
+        chunk = chunk.replace('\n', ' ').strip()
+        if len(chunk) > 12:
+            return chunk[:width]
+    return None
+
+
+def _ki_mine_amount(text, bonus_ranges=()):
+    """지원금액 마이닝. 심판 수정: ①tie-break per-인접도 ②총/per 채널 분리 +섹션보너스 +융자라벨."""
+    out = []
+    for m in _KI_MONEY.finditer(text):
+        num_s, unit = m.group(1), re.sub(r'\s', '', m.group(2))
+        try:
+            krw = float(num_s.replace(',', '')) * _KI_MULT[unit]
+        except (ValueError, KeyError):
+            continue
+        if unit == '원' and krw < 100000:
+            continue
+        if krw < 10000 or krw > 1e13:
+            continue
+        s, e = m.span()
+        before, after = text[max(0, s - 28):s], text[e:e + 14]
+        line_s = text.rfind('\n', 0, s) + 1
+        line = text[line_s:text.find('\n', e) if text.find('\n', e) > 0 else e + 40]
+        per_m, per_dist = _KI_PER.search(before), 9999
+        # per 마커와 금액 사이에 구분자·'총'이 끼면 다른 금액의 마커가 샌 것 —
+        # '( 1건당 1000만원 이내, 총 1억…)'에서 총액이 건당으로 오추출되는 버그 차단.
+        if per_m and re.search(r'[,，;/·총]|및', before[per_m.end():]):
+            per_m = None
+        if per_m:
+            per_dist = len(before) - per_m.end()
+        else:
+            am = _KI_PER.search(after[:8])
+            if am and not re.search(r'[,，;/·]|및', after[:am.start()]):
+                per_m, per_dist = am, am.start()
+        qual_m = _KI_QUAL.search(before[-14:] + ' ' + after)
+        label_m = _KI_AMOUNT_LABEL.search(line)
+        label_txt = re.sub(r'\s', '', label_m.group(0)) if label_m else ''
+        loan = bool(re.match(r'(융자|대출|보증)', label_txt))
+        total = bool(re.search(r'총\s*$|총\s*사업비', before))
+        score = (3 if per_m else 0) + (2 if qual_m else 0) + (2 if label_m else 0) \
+            + (1 if krw >= 1e6 else 0) + (1 if total else 0)
+        if _KI_AMOUNT_NEG.search(before):
+            score -= 5
+        if any(a <= s < b for a, b in bonus_ranges):
+            score += 2
+        if loan:
+            disp = '융자한도 ' + _ki_fmt_krw(krw) \
+                + (' ' + qual_m.group(0) if qual_m and qual_m.group(0) in ('이내', '내외', '까지') else '')
+        else:
+            disp = ''.join(filter(None, [
+                (per_m.group(0).replace(' ', '') + ' ') if per_m else ('총 ' if total else ''),
+                (qual_m.group(0) + ' ') if qual_m and qual_m.group(0) in ('최대', '한도') else '',
+                _ki_fmt_krw(krw),
+                ' ' + qual_m.group(0) if qual_m and qual_m.group(0) in ('이내', '내외', '까지', '상한') else '',
+            ]))
+        out.append({'krw': krw, 'disp': disp.strip(), 'score': score, 'per_dist': per_dist,
+                    'per': bool(per_m), 'total': total})
+    # tie-break: score 동률 시 per-마커 인접도(거리 최소) 우선 — '-krw 최대' 오추출 버그 수정
+    out.sort(key=lambda d: (-d['score'], d['per_dist'], -d['krw']))
+    per_d = next((d for d in out if d['per'] and d['score'] >= 2), None)
+    total = next((d['disp'] for d in out if d['total'] and not d['per']), None)
+    # 총액 단독(per 없음)은 지원금액(per 채널)으로 절대 승격 금지
+    best_d = next((d for d in out if d['score'] >= 2 and not (d['total'] and not d['per'])), None)
+    rate_m = _KI_RATE.search(text)
+    return {'per': per_d['disp'] if per_d else None,
+            'per_krw': per_d['krw'] if per_d else 0,
+            'total': total,
+            'best': best_d['disp'] if best_d else None,
+            'best_krw': best_d['krw'] if best_d else 0,
+            'rate': f"{rate_m.group(1)}% {rate_m.group(2)}" if rate_m else None}
+
+
+def _ki_mine_scale(text):
+    """선정규모 마이닝. 단위 union('건' 추가), 명/팀/건은 모집·선정 문맥 필수."""
+    cands = []
+    for m in _KI_SCALE.finditer(text):
+        s, e = m.span()
+        if re.search(r'제\s*$', text[max(0, s - 3):s]):
+            continue
+        if re.search(r'^\s*(차|회|년|월|일|개월|당)', text[e:e + 3]):
+            continue
+        window = text[max(0, s - 32):e + 18]
+        unit = re.sub(r'\s', '', m.group(2))
+        if unit in ('명', '팀', '건') and not re.search(r'(모집|선정|선발|채용)', window):
+            continue
+        score = 0
+        if m.group(3):
+            score += 2
+        if _KI_SCALE_CTX.search(window):
+            score += 2
+        if re.search(r'(규모|인원)\s*[):：\]]?\s*$', text[max(0, s - 14):s]):
+            score += 2
+        cands.append({'disp': f"{m.group(1)}{unit}" + (f" {m.group(3)}" if m.group(3) else ''),
+                      'score': score})
+    cands.sort(key=lambda d: -d['score'])
+    return cands[0]['disp'] if cands and cands[0]['score'] >= 2 else None
+
+
+def _ki_mine_contact(text, extra_scans=()):
+    """문의처: ①전화+같은줄 기관 페어링(팩스 제외) ②'문의' 윈도우 ③신청방법 섹션 ④이메일.
+    폴백 결과 12자 미만은 쓰레기값으로 폐기 (심판 병합 권고 직렬 체인)."""
+    found, seen = [], set()
+    for m in _KI_PHONE.finditer(text):
+        digits = ''.join(m.groups())
+        if digits in seen:
+            continue
+        pre = text[max(0, m.start() - 12):m.start()]
+        if re.search(r'(팩스|FAX|Fax)\s*[:：)]?\s*$', pre):
+            continue
+        seen.add(digits)
+        line_s = max(text.rfind('\n', 0, m.start()), 0)
+        orgs = list(_KI_ORG.finditer(text[line_s:m.start()]))
+        org = re.sub(r'^[\s()（）·&]+', '', orgs[-1].group(1).strip()) if orgs else ''
+        found.append((org + ' ' + f"{m.group(1)}-{m.group(2)}-{m.group(3)}").strip())
+    for m in _KI_HOTLINE.finditer(text):
+        num = m.group(1) + (('-' + m.group(2)) if m.group(2) else '')
+        if num not in seen:
+            seen.add(num)
+            found.append(f"통합콜센터 {num} (국번없이)")
+    if found:
+        return found[0]
+    # A 폴백 체인
+    scans = [_ki_label_window(text, _KI_CONTACT_LABEL, width=110, strict=False)]
+    scans.extend(extra_scans)
+    for scan in scans:
+        if not scan:
+            continue
+        pm = _KI_PHONE.search(scan)
+        if pm:
+            orgs = list(_KI_ORG.finditer(scan[:pm.start()]))
+            org = orgs[-1].group(1).strip() if orgs else ''
+            cand = (org + ' ' + f"{pm.group(1)}-{pm.group(2)}-{pm.group(3)}").strip()
+            if len(cand) >= 12:
+                return cand
+        em = _KI_EMAIL.search(scan)
+        if em and len(em.group(0)) >= 12:
+            return em.group(0)
+    em = _KI_EMAIL.search(text)
+    if em and len(em.group(0)) >= 12:
+        ctx_w = text[max(0, em.start() - 60):em.end() + 20]
+        if re.search(r'(문의|연락)', ctx_w):
+            return em.group(0)
+    return None
+
+
+def _ki_mine_target(text, strict=True):
+    snippet = _ki_label_window(text, _KI_ELIG_LABEL, strict=strict)
+    if not snippet:
+        scored = []
+        for sg in re.split(r'\n|(?=[❍◦○□■▶ㅇ])', text):
+            sg = sg.strip()
+            if not (15 <= len(sg) <= 220):
+                continue
+            kws = set(_KI_ELIG_KW.findall(sg))
+            if len(kws) >= 2:
+                scored.append((len(kws), sg))
+        scored.sort(key=lambda t: -t[0])
+        snippet = scored[0][1][:170] if scored else None
+    tags = {}
+    scan = snippet or text[:1500]
+    rm = _KI_TAG_REGION.search(scan)
+    if rm:
+        tags['region'] = (rm.group(1) or rm.group(2))
+    ym = _KI_TAG_YEARS.search(scan) or _KI_TAG_YEARS.search(text)
+    if ym:
+        tags['years'] = f"창업 {ym.group(1)}년 {ym.group(2)}"
+    sm = _KI_TAG_SALES.search(scan) or _KI_TAG_SALES.search(text)
+    if sm:
+        tags['sales'] = f"매출 {sm.group(1)}{sm.group(2) or ''}원 {sm.group(3) or ''}".strip()
+    for kw in ('소상공인', '중소·중견기업', '중소기업', '중견기업', '예비창업자', '개인사업자'):
+        if kw in scan:
+            tags['type'] = kw
+            break
+    return {'snippet': snippet, 'tags': tags}
+
+
+def _ki_mine_apply(text, strict=True):
+    snippet = _ki_label_window(text, _KI_APPLY_LABEL, width=150, strict=strict)
+    scan = snippet or text
+    channels = [name for name, rx in _KI_CH_PATTERNS if rx.search(scan)]
+    if not channels and snippet is None:
+        channels = [name for name, rx in _KI_CH_PATTERNS if rx.search(text)]
+    sys_m = _KI_SYSTEMS.search(text)
+    url_m = next((u for u in _KI_URL.finditer(scan) if not _KI_HOMETAX_BLOCK.search(u.group(0))), None)
+    if not url_m:
+        for um in _KI_URL.finditer(text):
+            if _KI_HOMETAX_BLOCK.search(um.group(0)):
+                continue
+            ctx_w = text[max(0, um.start() - 60):um.end() + 60]
+            if re.search(r'(신청|접수|홈페이지|시스템|포털|누리집)', ctx_w):
+                url_m = um
+                break
+    email_m = _KI_EMAIL.search(scan) or _KI_EMAIL.search(text)
+    return {'snippet': snippet, 'channels': channels,
+            'system': sys_m.group(1) if sys_m else None,
+            'url': url_m.group(0) if url_m else None,
+            'email': email_m.group(0) if email_m else None}
+
+
+def extract_key_fields(text, source_kind='attach'):
+    """공고 텍스트(첨부 전문 또는 사업개요)에서 핵심정보 dict 추출.
+
+    반환: {지원금액, 지원금액_총, 선정규모, 지원대상, 지원대상_태그, 지원내용,
+    신청방법, 문의처}의 부분집합 — 빈 값 키는 생략, 전 필드 optional.
+    절대 raise하지 않음(마이너별 격리). source_kind: 'attach'|'overview'.
+    """
+    try:
+        t = _ki_clean_text(text or '')
+        if not t or len(t) < 20:
+            return {}
+        # strict((c)행 규칙)는 개행 구조가 있는 첨부 전문(PDF)에만 — 개요(한 줄 흐름)나
+        # HWPX/HWP 평탄화 텍스트에 적용하면 정상 라벨까지 차단(실측 V1/V2 비교로 확정).
+        strict = (source_kind != 'overview') and (t.count('\n') / max(len(t), 1) >= 1.0 / 200)
+        try:
+            sections = _ki_split_sections(t, strict=strict)
+        except Exception:
+            sections = {}
+        bonus = [sections[k] for k in ('지원규모', '지원내용') if k in sections]
+        apply_section = ''
+        if '신청방법' in sections:
+            a, b = sections['신청방법']
+            apply_section = t[a:b]
+        fields = {}
+        try:
+            amount = _ki_mine_amount(t, bonus_ranges=bonus)
+        except Exception:
+            amount = {'per': None, 'per_krw': 0, 'total': None, 'best': None, 'best_krw': 0, 'rate': None}
+        chosen = amount['per'] or amount['best']
+        chosen_krw = amount['per_krw'] or amount['best_krw']
+        if amount['rate'] and (not chosen or chosen_krw < 1e6):
+            fields['지원금액'] = _ki_cap(amount['rate'] + (f" (+{chosen})" if chosen else ''), 60)
+        elif chosen:
+            fields['지원금액'] = _ki_cap(chosen, 60)
+        if amount['total']:
+            fields['지원금액_총'] = _ki_cap(amount['total'], 40)
+        try:
+            scale = _ki_mine_scale(t)
+        except Exception:
+            scale = None
+        if scale:
+            fields['선정규모'] = _ki_cap(scale, 40)
+        try:
+            target = _ki_mine_target(t, strict=strict)
+        except Exception:
+            target = {'snippet': None, 'tags': {}}
+        if target['snippet']:
+            fields['지원대상'] = _ki_cap(target['snippet'], 150)
+            if target['tags']:
+                fields['지원대상_태그'] = {k: str(v)[:20] for k, v in target['tags'].items()}
+        try:
+            ap = _ki_mine_apply(t, strict=strict)
+        except Exception:
+            ap = {'snippet': None, 'channels': [], 'system': None, 'url': None, 'email': None}
+        if ap['channels'] or ap['snippet']:
+            parts = []
+            if ap['channels']:
+                parts.append('/'.join(ap['channels']))
+            ref = ap['system'] or ap['url'] or ap['email']
+            if ref:
+                parts.append(f"({ref})")
+            fields['신청방법'] = _ki_cap(' '.join(parts) if parts else (ap['snippet'] or '')[:80], 100)
+        try:
+            contact = _ki_mine_contact(t, extra_scans=(apply_section,))
+        except Exception:
+            contact = None
+        if contact:
+            fields['문의처'] = _ki_cap(contact, 100)
+        try:
+            content = _ki_label_window(t, _KI_CONTENT_LABEL, width=240, strict=strict)
+        except Exception:
+            content = None
+        if content:
+            fields['지원내용'] = _ki_cap(content, 250)
+        return fields
+    except Exception:
+        return {}
+
+
+def _fetch_best_attachment_text(soup, html, link, base_url, ctx=None, max_files=2, max_pdf_pages=5):
+    """상세 페이지에서 최우선 첨부(공고문류) 본문 텍스트 추출. 반환 (파일명, 전문).
+    탐색 순서: find_attachment_links → ctx['attachment_resolver'] → raw-HTML 폴백.
+    """
+    ctx = ctx or {}
+    session = ctx.get('session')
+    attachments = find_attachment_links(soup, base_url=base_url)
+    site_resolver = ctx.get('attachment_resolver')
+    if site_resolver:
+        try:
+            extra = site_resolver(soup, base_url) or []
+            attachments = list(attachments) + list(extra)
+        except Exception:
+            pass
+    if not attachments:
+        attachments = list(_find_attachments_in_raw_html(html, base_url))
+    for fname, furl, ext in attachments[:max_files]:
+        txt = ""
+        # Referer를 상세 페이지로 설정 — 일부 사이트는 referer 검증으로 차단
+        if ext == 'pdf':
+            txt = extract_text_from_pdf(furl, session=session, referer=link, max_pages=max_pdf_pages)
+        elif ext == 'hwpx':
+            txt = extract_text_from_hwpx(furl, session=session, referer=link)
+        elif ext == 'hwp':
+            txt = extract_text_from_hwp(furl, session=session, referer=link)
+        if txt and len(txt) > 100:
+            return fname, txt
+    return '', ''
+
+
+def _load_existing_extras():
+    """이전 data.json에서 링크→{핵심정보, _ext} 캐시 (스키마 버전 일치분만).
+    copy-forward가 모든 fetch보다 선행 → 차단 run에도 이전 ok 데이터 비파괴.
+    """
+    web_data_path = os.path.join(os.path.dirname(__file__), 'biz_support_web', 'data.json')
+    out = {}
+    try:
+        with open(web_data_path, 'r', encoding='utf-8') as f:
+            for it in json.load(f).get('data', []):
+                link = (it.get('링크') or '').strip()
+                ki, ext = it.get('핵심정보'), it.get('_ext')
+                if not link or not (ki or ext):
+                    continue
+                if ext and ext.get('v') not in (None, KEYINFO_VERSION):
+                    continue  # 버전 bump → 통제된 재백필
+                out[link] = {'핵심정보': ki, '_ext': ext}
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return out
+
+
+def extract_key_info_pass(items, cap=None, deadline_sec=None, bizinfo_ok=True, cache=None):
+    """[별도 pass — save_to_web_json 직전 호출] 카드에 '핵심정보'(+'_ext')를 채운다.
+    기존 6필드(지원사업명/신청기간/링크/사업개요/출처/first_seen)는 절대 수정하지 않음.
+
+    1단계: 전 항목 사업개요 오프라인 마이닝(네트워크 0, ~1초).
+    2단계: 문의처·신청방법·지원내용 결측 항목만 첨부 다운로드.
+           PR1은 비즈인포 도메인 한정, EXTRACT_WORKERS 병렬 + 건당 0.5s 간격,
+           cap/deadline + 도메인 장애 격리(연속 8실패 또는 실패율>50% 시 잔여 중단).
+    _ext: {v:스키마버전, st:ok|none|fail, n:시도횟수, at:날짜} — ok는 fail로 덮이지 않고,
+    같은 날 재시도 금지 + n≥4 영구 제외(day-backoff).
+    """
+    cap = EXTRACT_CAP if cap is None else cap
+    deadline_sec = EXTRACT_DEADLINE_SEC if deadline_sec is None else deadline_sec
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    if cache is None:
+        cache = _load_existing_extras()
+    # ① 캐시 copy-forward
+    for it in items:
+        c = cache.get((it.get('링크') or '').strip())
+        if c:
+            if c.get('핵심정보') and not it.get('핵심정보'):
+                it['핵심정보'] = c['핵심정보']
+            if c.get('_ext') and not it.get('_ext'):
+                it['_ext'] = c['_ext']
+    # ② 1단계: 사업개요 오프라인 마이닝
+    mined = 0
+    for it in items:
+        if it.get('핵심정보'):
+            continue
+        ov = it.get('사업개요') or ''
+        if len(ov) < 40:
+            continue
+        f = extract_key_fields(ov, source_kind='overview')
+        if f:
+            it['핵심정보'] = f
+            mined += 1
+    # ③ 2단계: 첨부 보강
+    def _needs_attach(it):
+        ki = it.get('핵심정보') or {}
+        return not (ki.get('문의처') and ki.get('신청방법') and ki.get('지원내용'))
+
+    def _ext_allows(it):
+        ext = it.get('_ext') or {}
+        if ext.get('st') == 'ok' and ext.get('v') == KEYINFO_VERSION:
+            return False
+        if ext.get('at') == today_str:
+            return False
+        if int(ext.get('n') or 0) >= 4:
+            return False
+        return True
+
+    cands = [it for it in items
+             if bizinfo_ok and 'bizinfo.go.kr' in (it.get('링크') or '')
+             and _needs_attach(it) and _ext_allows(it)]
+    cands.sort(key=lambda it: 0 if not it.get('_ext') else 1)  # 신규 우선
+    cands = cands[:max(0, cap)]
+    t0 = time.monotonic()
+    stats = {'ok': 0, 'none': 0, 'fail': 0, 'skip': 0}
+    state = {'consec_fail': 0, 'aborted': False}
+
+    def _one(it):
+        if state['aborted'] or time.monotonic() - t0 > deadline_sec:
+            stats['skip'] += 1
+            return
+        link = it.get('링크') or ''
+        try:
+            html = fetch_html(link, timeout=15)
+            soup = BeautifulSoup(html, 'html.parser')
+            _fn, txt = _fetch_best_attachment_text(
+                soup, html, link, base_url='https://www.bizinfo.go.kr',
+                ctx={}, max_files=2, max_pdf_pages=10)
+            n = int((it.get('_ext') or {}).get('n') or 0) + 1
+            if txt:
+                f = extract_key_fields(txt, source_kind='attach')
+                if f:
+                    merged = dict(it.get('핵심정보') or {})
+                    merged.update(f)  # 첨부 전문이 개요 마이닝보다 우선
+                    it['핵심정보'] = merged
+                    it['_ext'] = {'v': KEYINFO_VERSION, 'st': 'ok', 'n': n, 'at': today_str}
+                    stats['ok'] += 1
+                else:
+                    it['_ext'] = {'v': KEYINFO_VERSION, 'st': 'none', 'n': n, 'at': today_str}
+                    stats['none'] += 1
+            else:
+                it['_ext'] = {'v': KEYINFO_VERSION, 'st': 'none', 'n': n, 'at': today_str}
+                stats['none'] += 1
+            state['consec_fail'] = 0
+        except Exception:
+            stats['fail'] += 1
+            state['consec_fail'] += 1
+            n_prev = int((it.get('_ext') or {}).get('n') or 0)
+            it['_ext'] = {'v': KEYINFO_VERSION, 'st': 'fail', 'n': n_prev + 1, 'at': today_str}
+            done = stats['ok'] + stats['none'] + stats['fail']
+            if state['consec_fail'] >= 8 or (done >= 10 and stats['fail'] / done > 0.5):
+                state['aborted'] = True  # 도메인 장애 격리 — 잔여 항목 _ext 미갱신
+        finally:
+            time.sleep(0.5)
+
+    if cands:
+        print(f"[핵심정보] 첨부 보강 대상 {len(cands)}건 (cap={cap}, workers={EXTRACT_WORKERS})")
+        with ThreadPoolExecutor(max_workers=EXTRACT_WORKERS) as pool:
+            list(pool.map(_one, cands))
+    total_ki = sum(1 for it in items if it.get('핵심정보'))
+    print(f"[핵심정보] 개요 마이닝 {mined}건 / 첨부 ok {stats['ok']}·none {stats['none']}"
+          f"·fail {stats['fail']}·skip {stats['skip']}"
+          f"{' (도메인 장애로 중단)' if state['aborted'] else ''}"
+          f" / 총 보유 {total_ki}/{len(items)}건")
+
+
+def backfill_key_info(cap=2000):
+    """[로컬 운영용 백필] 저장소 data.json(../data.json)에 핵심정보를 직접 채운다.
+    Actions 러너 IP는 비즈인포에 간헐 차단되므로 백필은 로컬(한국 IP)에서 실행:
+      EXTRACT_CAP=2000 venv/bin/python -c "import sys; sys.path.insert(0,'crawler');
+      import unified_crawler as uc; uc.backfill_key_info()"
+    last_updated·기존 필드·항목 순서는 건드리지 않는다(순수 additive).
+    """
+    path = os.path.join(os.path.dirname(__file__), '..', 'data.json')
+    with open(path, 'r', encoding='utf-8') as f:
+        payload = json.load(f)
+    items = payload.get('data', [])
+    cache = {}
+    for it in items:
+        link = (it.get('링크') or '').strip()
+        if link and (it.get('핵심정보') or it.get('_ext')):
+            cache[link] = {'핵심정보': it.get('핵심정보'), '_ext': it.get('_ext')}
+    extract_key_info_pass(items, cap=cap, cache=cache)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"[핵심정보] 백필 저장 완료: {path} ({len(items)}건)")
+
+
 def enrich_detail(item, ctx=None):
     """item['링크'] 페이지를 fetch → HTML/첨부 → 사업개요 채움. item을 in-place 수정."""
     ctx = ctx or {}
@@ -807,32 +1436,9 @@ def enrich_detail(item, ctx=None):
 
     # HTML에서 충분히 못 얻으면 첨부파일 시도 (PDF > HWPX > HWP 순)
     if (not summary or len(summary) < 60) and ctx.get('use_attachments', True):
-        attachments = find_attachment_links(soup, base_url=base_url)
-        # 사이트별 추가 후처리: ITP 같이 javascript 콜백만 있는 사이트
-        site_resolver = ctx.get('attachment_resolver')
-        if site_resolver:
-            try:
-                extra = site_resolver(soup, base_url) or []
-                attachments = list(attachments) + list(extra)
-            except Exception:
-                pass
-        # 실패 시 raw HTML regex로 다운로드 URL 후보 추가
-        if not attachments:
-            extra = _find_attachments_in_raw_html(html, base_url)
-            attachments = list(extra)
-
-        for fname, furl, ext in attachments:
-            txt = ""
-            # Referer를 상세 페이지로 설정 — 일부 사이트는 referer 검증으로 차단
-            if ext == 'pdf':
-                txt = extract_text_from_pdf(furl, session=session, referer=link)
-            elif ext == 'hwpx':
-                txt = extract_text_from_hwpx(furl, session=session, referer=link)
-            elif ext == 'hwp':
-                txt = extract_text_from_hwp(furl, session=session, referer=link)
-            if txt and len(txt) > 100:
-                summary = summarize_long_text(txt, max_len=500)
-                break
+        _fn, txt = _fetch_best_attachment_text(soup, html, link, base_url, ctx=ctx)
+        if txt:
+            summary = summarize_long_text(txt, max_len=500)
 
     if summary:
         item['사업개요'] = summary
@@ -944,14 +1550,21 @@ def _load_prev_bizinfo_items():
                 continue
         except Exception:
             pass
-        preserved.append({
+        p = {
             '지원사업명': it.get('지원사업명', ''),
             '신청기간': it.get('신청기간', ''),
             '링크': it.get('링크', ''),
             '사업개요': it.get('사업개요', ''),
             '등록일자': it.get('등록일자', ''),
             '출처': '비즈인포',
-        })
+        }
+        # 핵심정보/_ext도 보존 — 미보존 시 비즈인포 차단일마다 신필드가 통째로
+        # 증발해 익일 전체 재추출 폭주가 생긴다.
+        if it.get('핵심정보'):
+            p['핵심정보'] = it['핵심정보']
+        if it.get('_ext'):
+            p['_ext'] = it['_ext']
+        preserved.append(p)
     print(f"[비즈인포] 이전 데이터 보존: {len(preserved)}건 (마감 제외 {dropped}건)")
     return preserved
 
@@ -3450,6 +4063,7 @@ def main():
     print("=" * 60)
     final_results = []
     driver = None
+    bizinfo_preserved = False  # 예외 시 NameError 방지 — try 내부에서 재할당
 
 
     # 1. 기업마당 (BizInfo) — 엑셀 일괄 수집 + requests 점진적 상세 보강 (Selenium 미사용)
@@ -3651,6 +4265,13 @@ def main():
     if not final_results:
         print("수집된 데이터가 없습니다.")
         return
+
+    # 핵심정보(첨부 공고문 구조화 추출) — 별도 pass, 실패해도 기존 카드 무손상.
+    # 비즈인포 보존 모드(차단일)에는 같은 도메인 첨부 다운로드도 막힐 것이므로 스킵.
+    try:
+        extract_key_info_pass(final_results, bizinfo_ok=not bizinfo_preserved)
+    except Exception as e:
+        print(f"[핵심정보] 추출 pass 실패(격리됨, 기존 카드 무손상): {e}")
 
     # 웹 뷰어 data.json 갱신
     saved_count = save_to_web_json(final_results)

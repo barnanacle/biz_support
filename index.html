@@ -416,6 +416,35 @@
       padding-left: 10px;
     }
 
+    /* 핵심정보(첨부 공고문 구조화 추출) 행 */
+    .key-info {
+      margin: 2px 0 8px;
+      padding: 8px 11px;
+      border-radius: 9px;
+      background: rgba(99, 102, 241, .07);
+      border: 1px solid rgba(99, 102, 241, .16);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .ki-row {
+      display: flex;
+      gap: 8px;
+      font-size: .78rem;
+      line-height: 1.5;
+    }
+
+    .ki-label {
+      flex: 0 0 auto;
+      opacity: .62;
+      white-space: nowrap;
+    }
+
+    .ki-value {
+      word-break: break-all;
+    }
+
     .overview.expanded {
       -webkit-line-clamp: unset;
     }
@@ -854,8 +883,18 @@
       return result.filter(item =>
         (item['지원사업명'] || '').toLowerCase().includes(lower) ||
         (item['출처'] || '').toLowerCase().includes(lower) ||
-        (item['사업개요'] || '').toLowerCase().includes(lower)
+        (item['사업개요'] || '').toLowerCase().includes(lower) ||
+        kiHaystack(item).includes(lower)
       );
+    }
+
+    // 핵심정보(중첩 객체 포함)를 검색용 평문으로 — '5천만원'·'소상공인' 등 적중
+    function kiHaystack(item) {
+      const ki = item['핵심정보'];
+      if (!ki) return '';
+      return Object.values(ki)
+        .map(v => typeof v === 'string' ? v : Object.values(v || {}).join(' '))
+        .join(' ').toLowerCase();
     }
 
     // ── Render ───────────────────────────────────────
@@ -910,6 +949,31 @@
         ? `<span class="badge badge-new" title="최근 1일 내 등록·발견된 신규 공고">🆕 신규</span>`
         : '';
 
+      // 핵심정보(첨부 공고문 구조화 추출) — 존재 필드만 행으로 표시
+      const ki = item['핵심정보'] || null;
+      let keyInfoHTML = '';
+      if (ki) {
+        const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const rows = [];
+        const amt = ki['지원금액']
+          ? ki['지원금액'] + (ki['지원금액_총'] ? ` (${ki['지원금액_총']})` : '')
+          : ki['지원금액_총'];
+        if (amt) rows.push(['💰 지원금액', amt]);
+        if (ki['선정규모']) rows.push(['👥 선정규모', ki['선정규모']]);
+        const tags = ki['지원대상_태그'];
+        const targetDisp = (tags && Object.values(tags).filter(Boolean).length)
+          ? Object.values(tags).filter(Boolean).join(' · ')
+          : ki['지원대상'];
+        if (targetDisp) rows.push(['🎯 지원대상', targetDisp]);
+        if (ki['신청방법']) rows.push(['📝 신청방법', ki['신청방법']]);
+        if (ki['문의처']) rows.push(['📞 문의처', ki['문의처']]);
+        if (rows.length) {
+          keyInfoHTML = `<div class="key-info">` + rows.map(([l, v]) =>
+            `<div class="ki-row"><span class="ki-label">${l}</span><span class="ki-value">${esc(v)}</span></div>`
+          ).join('') + `</div>`;
+        }
+      }
+
       return `
 <div class="card${isChecked ? ' checked' : ''}" id="card-${idx}" data-link="${link.replace(/"/g, '&quot;')}">
   <div class="card-header">
@@ -924,6 +988,7 @@
     ${supportBadge}
     ${buildBadgePeriod(period)}
   </div>
+  ${keyInfoHTML}
   ${overviewHTML}
   <div class="card-footer">
     <a class="link-btn" href="${link}" target="_blank" rel="noopener">공고 바로가기 ↗</a>
@@ -987,8 +1052,11 @@
       const overviewEl = card.querySelector('.overview');
       const overview = overviewEl ? overviewEl.innerText.trim() : '사업개요 없음';
       const link = card.querySelector('.link-btn')?.href || '';
+      // 핵심정보 rows도 복사 텍스트에 포함 (shotsforge 클립보드 워크플로 대응)
+      const kiLines = [...card.querySelectorAll('.ki-row')]
+        .map(r => r.innerText.replace(/\s+/g, ' ').trim()).filter(Boolean).join('\n');
 
-      const text = `[${source}] ${title}\n신청기간: ${period}\n링크: ${link}\n\n${overview}`;
+      const text = `[${source}] ${title}\n신청기간: ${period}\n${kiLines ? kiLines + '\n' : ''}링크: ${link}\n\n${overview}`;
       navigator.clipboard.writeText(text).then(() => {
         const btn = document.getElementById(`copy-${idx}`);
         btn.textContent = '✅';
