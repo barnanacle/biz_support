@@ -80,6 +80,32 @@ def _merge_url_params(url, params):
     return urlunparse(parsed._replace(query=urlencode(merged)))
 
 
+def _maybe_relay(final_url, headers):
+    """비즈인포 릴레이 활성 시 www.bizinfo.go.kr URL을 릴레이 URL로 투명 재작성.
+
+    _BIZINFO_STATE['relay']가 True(직접 접속 실패 후 폴백 발동)이고 대상 호스트가
+    www.bizinfo.go.kr일 때만 URL을 BIZINFO_RELAY_BASE로 재작성하고 X-Relay-Key
+    헤더를 병합한다. 이 한 지점으로 엑셀·상세페이지 enrich·첨부 다운로드가 전부
+    릴레이를 타므로 기존 파서·필터·보강 코드를 무변경 재사용한다.
+
+    env(BIZINFO_RELAY_BASE) 미설정 로컬 환경에서는 relay 플래그가 켜질 수 없어
+    완전한 no-op — 기존 동작과 동일. (상수들은 모듈 하단에 정의되지만 호출 시점
+    조회라 전방 참조 문제 없음.)
+    """
+    try:
+        if not (_BIZINFO_STATE.get('relay') and BIZINFO_RELAY_BASE):
+            return final_url, headers
+        parsed = urlparse(final_url)
+        if parsed.netloc != 'www.bizinfo.go.kr':
+            return final_url, headers
+        new_url = BIZINFO_RELAY_BASE + parsed.path + (('?' + parsed.query) if parsed.query else '')
+        merged = dict(headers or {})
+        merged['X-Relay-Key'] = BIZINFO_RELAY_KEY
+        return new_url, merged
+    except Exception:
+        return final_url, headers
+
+
 def fetch_html(url, *, session=None, timeout=20, params=None, headers=None,
                encoding=None, allow_scrapling=True):
     """
@@ -98,6 +124,7 @@ def fetch_html(url, *, session=None, timeout=20, params=None, headers=None,
       HTML 문자열. 두 경로 모두 실패하면 마지막 예외를 그대로 raise.
     """
     final_url = _merge_url_params(url, params)
+    final_url, headers = _maybe_relay(final_url, headers)  # 비즈인포 릴레이 (비활성 시 no-op)
 
     # 1) Scrapling Fetcher 시도 — 단, 명시 session이 없을 때만
     if session is None and allow_scrapling and _SCRAPLING_FETCHER is not None:
@@ -156,6 +183,7 @@ def fetch_bytes(url, *, params=None, timeout=30, headers=None):
     두 경로 모두 bytes를 반환한다.
     """
     final_url = _merge_url_params(url, params)
+    final_url, headers = _maybe_relay(final_url, headers)  # 비즈인포 릴레이 (비활성 시 no-op)
     if _SCRAPLING_FETCHER is not None:
         try:
             # verify=False: fetch_html과 동일 — 공공기관 불완전 인증서 체인 대응.
@@ -211,6 +239,21 @@ BIZINFO_NOISE_RE = re.compile(
     r'선정\s*결과|결과\s*발표|모집\s*결과|평가\s*결과|설명회|간담회|안내문|'
     r'연기\s*공고|변경\s*공고|재공고\s*안내'
 )
+
+# ── P0: 비즈인포 릴레이/기업마당 JSON API 폴백 설정 ──────────────────────
+# GitHub Actions(Azure) 대역이 비즈인포 방화벽에 표적 차단(TCP SYN 드롭, 14일+)
+# → Cloudflare Pages 릴레이(seoryu)로 우회하는 4단 폴백 사다리:
+#   [엑셀 직접 → 엑셀 릴레이 → 기업마당 JSON API(릴레이) → 이전 데이터 보존]
+# env 미설정(로컬 기본) 시 릴레이·API 경로 전부 비활성 → 현행과 동일 동작.
+BIZINFO_RELAY_BASE = os.environ.get('BIZINFO_RELAY_BASE', '').rstrip('/')
+BIZINFO_RELAY_KEY = os.environ.get('BIZINFO_RELAY_KEY', '')
+BIZINFO_API_KEY = os.environ.get('BIZINFO_API_KEY', '')  # 기업마당 crtfcKey
+BIZINFO_API_URL = 'https://www.bizinfo.go.kr/uss/rss/bizinfoApi.do'
+# 기업마당 지원분야 대분류 코드 (JSON API searchLclasId)
+_BIZINFO_LCLAS = {'01': '금융', '02': '기술', '03': '인력', '04': '수출',
+                  '05': '내수', '06': '창업', '07': '경영', '09': '기타'}
+# 모듈 상태: relay=투명 릴레이 발동 여부, mode ∈ excel|api|preserved|None
+_BIZINFO_STATE = {'relay': False, 'mode': None}
 
 def setup_driver():
     chrome_options = Options()
@@ -1569,6 +1612,103 @@ def _load_prev_bizinfo_items():
     return preserved
 
 
+def _bizinfo_excel_bytes():
+    """비즈인포 엑셀 bytes 수신 — (1차) 직접, (2차) 직접 실패 시 릴레이 재시도.
+
+    릴레이 재시도 성공 시 _BIZINFO_STATE['relay']=True가 유지되어 이후 상세페이지
+    enrich·첨부 다운로드도 _maybe_relay로 자동 우회한다. 릴레이 미설정이면 직접
+    실패 예외를 그대로 올린다(현행 동일).
+    """
+    try:
+        return fetch_bytes(BIZINFO_EXCEL_URL, params={'rows': 15, 'cpage': 1}, timeout=40)
+    except Exception as e:
+        if not BIZINFO_RELAY_BASE:
+            raise
+        print(f"[비즈인포] 직접 수신 실패({e}) → 릴레이 재시도")
+        _BIZINFO_STATE['relay'] = True  # 이후 www.bizinfo.go.kr fetch 전부 릴레이 경유
+        content = fetch_bytes(BIZINFO_EXCEL_URL, params={'rows': 15, 'cpage': 1}, timeout=40)
+        # 릴레이가 HTML 에러페이지를 중계한 경우 openpyxl 전에 차단 (xlsx 매직넘버 PK)
+        if not content or content[:2] != b'PK':
+            raise RuntimeError('릴레이 응답이 xlsx가 아님 (매직넘버 PK 불일치)')
+        print("[비즈인포] 직접 실패 → 릴레이 성공")
+        return content
+
+
+def _crawl_bizinfo_via_api():
+    """엑셀(직접+릴레이) 실패 시 3차 폴백: 기업마당 JSON API → 기존 스키마 매핑.
+
+    BIZINFO_API_KEY와 릴레이 설정이 전제 — API 호스트도 www.bizinfo.go.kr이라
+    직접 접근은 동일하게 차단되므로 릴레이 경유(fetch_html의 _maybe_relay)가 필수.
+    분야코드 8개를 순회하되 INCLUDE 4분야('금융','기술','수출','창업')는 전량,
+    제외 4분야는 P1 회수 게이트(_is_reclaimable_title) 통과분만 수집 — 엑셀 경로와
+    필터 정책 일치. 사업개요(bsnsSumryCn)가 응답에 내장돼 상세 fetch가 불필요.
+    """
+    if not (BIZINFO_API_KEY and BIZINFO_RELAY_BASE):
+        return []
+    _BIZINFO_STATE['relay'] = True
+
+    def _d(s):
+        s = (s or '').strip()
+        # 'YYYYMMDD' → 'YYYY-MM-DD'. 비정형 값('예산 소진시까지' 등)은 원문 유지
+        # — _load_prev_bizinfo_items의 '파싱 실패=보존'과 동일한 보수 처리.
+        return f'{s[:4]}-{s[4:6]}-{s[6:8]}' if len(s) == 8 and s.isdigit() else s
+
+    today = datetime.now().date()
+    include_codes = {c for c, name in _BIZINFO_LCLAS.items()
+                     if name in BIZINFO_INCLUDE_FIELDS}
+    out, seen_links, reclaimed = [], set(), 0
+    for code in _BIZINFO_LCLAS:
+        raw = fetch_html(BIZINFO_API_URL, timeout=40,
+                         params={'crtfcKey': BIZINFO_API_KEY, 'dataType': 'json',
+                                 'searchCnt': '0', 'searchLclasId': code})
+        d = json.loads(raw)
+        # 무키/오류 응답은 HTTP 200 + reqErr 본문 → 상태코드가 아닌 본문 검사
+        if isinstance(d, dict) and 'reqErr' in d:
+            raise RuntimeError(f"기업마당 API 오류: {d['reqErr']}")
+        if isinstance(d, dict):
+            items = d.get('jsonArray') or d.get('item') or d.get('items') or []
+        else:
+            items = d if isinstance(d, list) else []
+        for it in items:
+            title = str(it.get('pblancNm') or '').strip()
+            link = str(it.get('pblancUrl') or '').strip()
+            if not title or not link or link in seen_links:
+                continue
+            if BIZINFO_NOISE_RE.search(title):
+                continue
+            # 분야 필터: 제외 분야는 P1 회수 게이트 통과분만 (엑셀 경로와 정책 일치)
+            if code not in include_codes:
+                try:
+                    reclaimable = _is_reclaimable_title(title)
+                except NameError:  # P1 게이트 미적용(revert) 시: 회수 없이 제외
+                    reclaimable = False
+                if not reclaimable:
+                    continue
+                reclaimed += 1
+            period_parts = [_d(p) for p in str(it.get('reqstBeginEndDe') or '').split('~')]
+            period = ' ~ '.join(p for p in period_parts if p) or '상시'
+            # 마감 필터: 종료일 파싱 성공 + 오늘 미만이면 제외 (엑셀 경로 (2)와 동일)
+            end_str = period.split('~')[-1].strip()[:10]
+            try:
+                if datetime.strptime(end_str, '%Y-%m-%d').date() < today:
+                    continue
+            except Exception:
+                pass
+            seen_links.add(link)
+            out.append({
+                '지원사업명': title,
+                '신청기간': period,
+                '링크': link,  # 절대 www.bizinfo.go.kr URL → first_seen·dedupe·캐시 키 호환
+                '사업개요': re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ',
+                                                   str(it.get('bsnsSumryCn') or ''))).strip(),
+                '등록일자': str(it.get('creatPnttm') or '')[:10],
+                '출처': '비즈인포',  # 즉시 태깅 — main()이 enrich를 생략
+            })
+        time.sleep(0.6)
+    print(f"[비즈인포] JSON API 수집 {len(out)}건 (제외분야회수 {reclaimed}건)")
+    return out
+
+
 def crawl_bizinfo_list(driver=None):
     """비즈인포(기업마당) 전체 공고를 엑셀 일괄 다운로드로 수집.
 
@@ -1582,14 +1722,28 @@ def crawl_bizinfo_list(driver=None):
     import openpyxl  # 무거운 의존성 → 함수 내부 import
     print("비즈인포(기업마당) 엑셀 일괄 수집 시작...")
     try:
-        content = fetch_bytes(BIZINFO_EXCEL_URL, params={'rows': 15, 'cpage': 1}, timeout=40)
+        # (1차) 직접 → (2차) 릴레이 재시도 (_bizinfo_excel_bytes 내부에서 처리)
+        content = _bizinfo_excel_bytes()
         # read_only=True는 이 xlsx의 dimension 메타데이터 부재로 1행만 인식 → 미사용.
         # 파일이 작아(~110KB) 일반 로드해도 부담 없음.
         wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
         ws = wb.active
         rows = list(ws.iter_rows(values_only=True))
+        _BIZINFO_STATE['mode'] = 'excel'
     except Exception as e:
-        print(f"[비즈인포] 엑셀 수집 실패 → 이전 data.json 비즈인포 항목 보존 시도: {e}")
+        print(f"[비즈인포] 엑셀 수집 실패(직접+릴레이): {e}")
+        # (3차) 기업마당 JSON API 폴백 (릴레이 경유, env 미설정 시 빈 결과)
+        try:
+            api_items = _crawl_bizinfo_via_api()
+        except Exception as api_e:
+            print(f"[비즈인포] JSON API 폴백 실패: {api_e}")
+            api_items = []
+        if api_items:
+            _BIZINFO_STATE['mode'] = 'api'
+            return api_items
+        # (4차) 기존 보존 경로 — 현행 로직 무변경
+        _BIZINFO_STATE['mode'] = 'preserved'
+        print("[비즈인포] 엑셀·API 모두 실패 → 이전 data.json 비즈인포 항목 보존 시도")
         return _load_prev_bizinfo_items()
 
     if not rows or len(rows) < 2:
@@ -4069,15 +4223,24 @@ def main():
     # 1. 기업마당 (BizInfo) — 엑셀 일괄 수집 + requests 점진적 상세 보강 (Selenium 미사용)
     try:
         bizinfo_list = crawl_bizinfo_list()  # 엑셀 다운로드 → 신청가능+핵심분야 필터
-        # 엑셀 수집 실패 시 crawl_bizinfo_list가 이전 data.json의 비즈인포 항목(미마감,
-        # '출처'='비즈인포' 이미 태깅됨)을 보존 반환한다. 정상 수집 항목엔 '출처'가 아직
-        # 없으므로 이걸로 보존 분기를 식별한다. 보존 항목을 enrich에 다시 보내면 차단된
-        # bizinfo.go.kr에 재접속해 무의미한 timeout이 누적되므로 상세 보강을 건너뛴다.
-        bizinfo_preserved = bool(bizinfo_list) and all(
-            it.get('출처') == '비즈인포' for it in bizinfo_list)
+        # 분기 식별은 _BIZINFO_STATE['mode'] 기반(excel|api|preserved).
+        # mode가 None인 예외 상황만 기존 출처 휴리스틱 폴백: 보존/API 항목은 이미
+        # '출처'='비즈인포'로 태깅돼 있고 정상 엑셀 수집 항목엔 '출처'가 아직 없다.
+        bizinfo_mode = _BIZINFO_STATE.get('mode')
+        if bizinfo_mode is None and bizinfo_list:
+            bizinfo_mode = 'preserved' if all(
+                it.get('출처') == '비즈인포' for it in bizinfo_list) else 'excel'
+        bizinfo_preserved = (bizinfo_mode == 'preserved')
         if bizinfo_preserved:
+            # 보존 항목을 enrich에 다시 보내면 차단된 bizinfo.go.kr에 재접속해
+            # 무의미한 timeout이 누적되므로 상세 보강을 건너뛴다.
             final_results.extend(bizinfo_list)
             print(f"[비즈인포] 엑셀 수집 실패 → 이전 데이터 {len(bizinfo_list)}건 보존 (상세 보강 생략)")
+        elif bizinfo_mode == 'api':
+            # JSON API 모드: 사업개요(bsnsSumryCn) 내장 + 출처 태깅 완료 → enrich 생략
+            # (상세 fetch 수백 회 절감).
+            final_results.extend(bizinfo_list)
+            print(f"[비즈인포] JSON API 모드 {len(bizinfo_list)}건 수집 (사업개요 내장 — 상세 보강 생략)")
         elif bizinfo_list:
             # 점진적 보강: 기존 data.json의 사업개요를 미리 채워두면
             # enrich_detail()이 '≥80자면 skip' 규칙으로 신규 공고만 fetch 한다.
@@ -4267,9 +4430,12 @@ def main():
         return
 
     # 핵심정보(첨부 공고문 구조화 추출) — 별도 pass, 실패해도 기존 카드 무손상.
-    # 비즈인포 보존 모드(차단일)에는 같은 도메인 첨부 다운로드도 막힐 것이므로 스킵.
+    # bizinfo_ok는 mode 기반: excel(직접/릴레이)·api(릴레이) 모드면 첨부 다운로드도
+    # _maybe_relay로 우회 가능하므로 활성. preserved(전면 실패)일 때만 비활성.
     try:
-        extract_key_info_pass(final_results, bizinfo_ok=not bizinfo_preserved)
+        extract_key_info_pass(
+            final_results,
+            bizinfo_ok=(_BIZINFO_STATE.get('mode') in ('excel', 'api')))
     except Exception as e:
         print(f"[핵심정보] 추출 pass 실패(격리됨, 기존 카드 무손상): {e}")
 

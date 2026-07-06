@@ -53,9 +53,27 @@ jobs:
           # 아래 '결과 확인' 단계에서 잡아낸다.
           cp data.json crawler/biz_support_web/data.json
 
+      - name: 도달성 probe (비차단 관찰용)
+        env:
+          BIZINFO_RELAY_BASE: ${{ secrets.BIZINFO_RELAY_BASE }}
+          BIZINFO_RELAY_KEY: ${{ secrets.BIZINFO_RELAY_KEY }}
+        run: |
+          # 러너에서의 도달성·차단 여부를 run 로그에 남긴다 (P0/P2 판정 및 장기 모니터링용).
+          # 전부 비차단(|| true) — probe 실패가 크롤링을 막지 않는다.
+          if [ -n "$BIZINFO_RELAY_BASE" ]; then
+            echo "probe relay(excel): $(curl -sS -o /dev/null -w '%{http_code}' -m 20 -H "X-Relay-Key: $BIZINFO_RELAY_KEY" "$BIZINFO_RELAY_BASE/sii/siia/selectSIIA200ExcelDownload.do?rows=15&cpage=1" || echo 'FAIL')" || true
+          else
+            echo "probe relay(excel): skip (BIZINFO_RELAY_BASE 미설정)"
+          fi
+          echo "probe sbiz24(api): $(curl -sS -o /dev/null -w '%{http_code}' -m 20 -X POST -H 'Content-Type: application/json' -H 'Origin-Method: GET' --data '{"sortModel":[],"search":{"pbancNm":""},"paging":true,"startRow":0,"endRow":1}' 'https://www.sbiz24.kr/api/combinePbanc/list' || echo 'FAIL')" || true
+          echo "probe bizinfo(직접): $(curl -sS -o /dev/null -w '%{http_code}' -m 20 'https://www.bizinfo.go.kr/uss/rss/bizinfoApi.do' || echo 'FAIL')" || true
+
       - name: 크롤링 실행
         env:
           DISPLAY: ':99'
+          BIZINFO_RELAY_BASE: ${{ secrets.BIZINFO_RELAY_BASE }}
+          BIZINFO_RELAY_KEY: ${{ secrets.BIZINFO_RELAY_KEY }}
+          BIZINFO_API_KEY: ${{ secrets.BIZINFO_API_KEY }}
         run: |
           # Xvfb 가상 디스플레이 (headless Chrome 안정성)
           sudo Xvfb :99 -screen 0 1920x1080x24 &
