@@ -255,6 +255,28 @@ _BIZINFO_LCLAS = {'01': '금융', '02': '기술', '03': '인력', '04': '수출'
 # 모듈 상태: relay=투명 릴레이 발동 여부, mode ∈ excel|api|preserved|None
 _BIZINFO_STATE = {'relay': False, 'mode': None}
 
+# ── P1: 제외 분야(경영·인력·내수·기타) 제목 회수용 보강 어휘 ─────────────
+# DIRECT_SUPPORT_KEYWORDS(HIGH/MID)가 못 잡는 직접지원 어휘.
+# 2026-07 fresh 1,416건 실측: HIGH+MID+EXTRA 게이트로 +211건 회수, hard 노이즈
+# ~2.4% (분야 통째 추가 시 25~35% 대비 10배 이상 깨끗). EXTRA 단독 55건은 오탐 0
+# (카드수수료 20·입점 10·인건비 7·설치지원 7·임차료 4·재기지원 4 등).
+# '재기' 단독은 '잠재기업'/'소재기업' 부분문자열 오탐 → 공백 유무 2형만 사용.
+BIZINFO_RECLAIM_EXTRA = (
+    '임차', '임대료', '인건비', '수수료', '입점',
+    '설치 지원', '설치지원', '재기 지원', '재기지원', '재정지원',
+)
+
+
+def _is_reclaimable_title(title):
+    """제외 분야 공고의 제목 기반 직접지원성 회수 판정.
+
+    DIRECT_SUPPORT_KEYWORDS_*는 모듈 하단에 정의되지만 호출 시점 조회라
+    전방 참조 문제 없음.
+    """
+    kws = (DIRECT_SUPPORT_KEYWORDS_HIGH + DIRECT_SUPPORT_KEYWORDS_MID
+           + BIZINFO_RECLAIM_EXTRA)
+    return any(kw in title for kw in kws)
+
 def setup_driver():
     chrome_options = Options()
     chrome_options.add_argument('--headless')
@@ -1766,7 +1788,7 @@ def crawl_bizinfo_list(driver=None):
 
     today = datetime.now().date()
     all_data = []
-    skipped_closed = skipped_field = skipped_noise = 0
+    skipped_closed = skipped_field = skipped_noise = reclaimed = 0
     for r in rows[1:]:
         if not r or len(r) <= max(i_title, i_url, i_field, i_end):
             continue
@@ -1786,10 +1808,13 @@ def crawl_bizinfo_list(driver=None):
             skipped_closed += 1
             continue
 
-        # (3) 핵심 분야 필터
+        # (3) 핵심 분야 필터 — 제외 분야여도 제목이 직접지원성이면 회수
+        # (2026-07 실측 +211건, hard 노이즈 ~2.4%. BIZINFO_INCLUDE_FIELDS 자체는 불변)
         if BIZINFO_INCLUDE_FIELDS and field not in BIZINFO_INCLUDE_FIELDS:
-            skipped_field += 1
-            continue
+            if not _is_reclaimable_title(title):
+                skipped_field += 1
+                continue
+            reclaimed += 1
 
         # (4) 노이즈 제목 제외
         if BIZINFO_NOISE_RE.search(title):
@@ -1805,7 +1830,8 @@ def crawl_bizinfo_list(driver=None):
         })
 
     print(f"[비즈인포] 엑셀 {len(rows)-1}건 중 수집 {len(all_data)}건 "
-          f"(마감제외 {skipped_closed} / 분야제외 {skipped_field} / 노이즈제외 {skipped_noise})")
+          f"(마감제외 {skipped_closed} / 분야제외 {skipped_field} / 노이즈제외 {skipped_noise}"
+          f" / 제외분야회수 {reclaimed})")
     return all_data
 
 
@@ -1936,6 +1962,7 @@ DIRECT_SUPPORT_KEYWORDS_HIGH = (
     '자금', '융자', '대출', '이차보전', '보조금', '지원금', '출연금',
     '기술료', '바우처', '사업화자금', '정책자금', '장려금', '금융지원',
     '현금지원', '환급', '세제지원', '세액공제', '투자유치', '보증',
+    '임차', '인건비', '수수료', '입점', '재기지원',  # 2026-07 축B 실측 승격
 )
 # 직접 금전 지원은 아니지만 실질적 기업 혜택이 있는 프로그램
 DIRECT_SUPPORT_KEYWORDS_MID = (
