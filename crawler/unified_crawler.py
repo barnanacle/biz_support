@@ -25,6 +25,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import collections
+import itertools
 import subprocess
 import os
 
@@ -45,6 +46,7 @@ KEYINFO_VERSION = 1            # 추출 스키마 버전 — 로직 개선 시 b
 EXTRACT_CAP = int(os.environ.get('EXTRACT_CAP', '200'))        # run당 첨부 보강 상한
 EXTRACT_DEADLINE_SEC = int(os.environ.get('EXTRACT_DEADLINE_SEC', '600'))
 EXTRACT_WORKERS = 4
+KEYINFO_DOMAIN_CAP = 40        # 도메인별 run당 첨부 보강 상한 (예의 — 독식 방지)
 
 # ────────────────────────────────────────────────────────────────────
 # Scrapling Fetcher (curl_cffi 기반 TLS fingerprint spoofing + HTTP/2)
@@ -335,7 +337,10 @@ SUMMARY_KEYWORDS = (
     '사업소개', '추진배경', '주요내용',
 )
 
-_ATTACH_EXT_RE = re.compile(r'\.(pdf|hwpx|hwp|docx?|xlsx?)(?:[?#&]|$)', re.I)
+# 확장자 뒤 공백·괄호를 lookahead로 허용 — 부산TP a텍스트 '공고문.hwp\n\t…(78KB)'
+# 불일치로 첨부 0건이던 버그 수정 (2026-07 축D 실측). 3개 사용처(텍스트 검출 2·
+# URL 확장자 확인 1) 모두 완화 방향이라 호환.
+_ATTACH_EXT_RE = re.compile(r'\.(pdf|hwpx|hwp|docx?|xlsx?)(?=[?#&\s)\]]|$)', re.I)
 _ATTACH_DOWNLOAD_HINTS = ('download', 'filedown', 'boardfile', 'streamdownload',
                           'fileview', 'fncfiledownload', 'attach', 'getfile')
 
@@ -643,6 +648,30 @@ def _itp_attachment_resolver(soup, base_url):
         display_fn = text or savedfn
         for cand in candidates:
             found.append((display_fn, cand, ext))
+    return found
+
+
+def _gbtp_attachment_resolver(soup, base_url):
+    """경북테크노파크(eGovFrame 표준): fn_egov_downFile('FILE_X','N') 콜백을
+    /cmm/fms/FileDown.do?atchFileId=X&fileSn=N 다운로드 URL로 정적 해석.
+
+    파일명(확장자 포함)은 a 태그 텍스트에 있으므로 텍스트 끝 확장자로 ext 판정.
+    (2026-07 축D 실측: GET 200·CSRF 불요 확인)
+    """
+    found = []
+    for a in soup.find_all('a'):
+        blob = ((a.get('onclick') or '') + ' ' + (a.get('href') or ''))
+        m = re.search(r"fn_egov_downFile\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"](\d+)['\"]\s*\)", blob)
+        if not m:
+            continue
+        fn = a.get_text(' ', strip=True)
+        em = re.search(r'\.(pdf|hwpx|hwp|docx?|xlsx?)\s*$', fn, re.I)
+        if not em:
+            continue
+        found.append((fn,
+                      f"https://www.gbtp.or.kr/cmm/fms/FileDown.do"
+                      f"?atchFileId={m.group(1)}&fileSn={m.group(2)}",
+                      em.group(1).lower()))
     return found
 
 
@@ -1329,14 +1358,42 @@ def _load_existing_extras():
     return out
 
 
+# ── P3: 2단계 첨부 보강 대상 도메인 allowlist ────────────────────────────
+# 기존 bizinfo 단독 게이트를 TP 도메인으로 확장 (2026-07 축D 실측: 전남·경남
+# 6필드 추출, 충남 첨부 발견, 부산은 _ATTACH_EXT_RE 수정으로 활성, 경북은
+# eGovFrame resolver로 복구). 'flag': 'bizinfo_ok' 도메인은 비즈인포 보존
+# 모드(bizinfo_ok=False)일 때만 제외 — TP 보강은 비즈인포 차단일에도 계속.
+KEYINFO_ATTACH_SOURCES = {
+    'bizinfo.go.kr': {'flag': 'bizinfo_ok'},
+    'www.jntp.or.kr': {},   # 전남TP — 직링크 hwp 실측 ok
+    'www.gntp.or.kr': {},   # 경남TP — raw 패턴B pdf 실측 ok
+    'www.ctp.or.kr': {},    # 충남TP — boardfiledownload.do 발견 ok
+    'www.btp.or.kr': {},    # 부산TP — _ATTACH_EXT_RE 수정 후 활성
+    'www.gbtp.or.kr': {'resolver': _gbtp_attachment_resolver},  # 경북TP — eGovFrame
+}
+
+
+def _ki_domain(link):
+    """링크의 첨부 보강 도메인 키 반환. bizinfo 서브도메인은 'bizinfo.go.kr'로
+    정규화, allowlist 미등재 도메인은 None."""
+    host = urlparse(link or '').netloc.split(':')[0].lower()
+    if host in KEYINFO_ATTACH_SOURCES:
+        return host
+    if host.endswith('bizinfo.go.kr'):
+        return 'bizinfo.go.kr'
+    return None
+
+
 def extract_key_info_pass(items, cap=None, deadline_sec=None, bizinfo_ok=True, cache=None):
     """[별도 pass — save_to_web_json 직전 호출] 카드에 '핵심정보'(+'_ext')를 채운다.
     기존 6필드(지원사업명/신청기간/링크/사업개요/출처/first_seen)는 절대 수정하지 않음.
 
     1단계: 전 항목 사업개요 오프라인 마이닝(네트워크 0, ~1초).
     2단계: 문의처·신청방법·지원내용 결측 항목만 첨부 다운로드.
-           PR1은 비즈인포 도메인 한정, EXTRACT_WORKERS 병렬 + 건당 0.5s 간격,
-           cap/deadline + 도메인 장애 격리(연속 8실패 또는 실패율>50% 시 잔여 중단).
+           대상은 KEYINFO_ATTACH_SOURCES 도메인 allowlist(비즈인포+TP 5),
+           EXTRACT_WORKERS 병렬 + 건당 0.5s 간격, cap/deadline +
+           도메인별 장애 격리(도메인별 연속 8실패 또는 실패율>50% 시 해당
+           도메인만 중단) + 도메인 라운드로빈 인터리브 + 도메인별 상한 40건.
     _ext: {v:스키마버전, st:ok|none|fail, n:시도횟수, at:날짜} — ok는 fail로 덮이지 않고,
     같은 날 재시도 금지 + n≥4 영구 제외(day-backoff).
     """
@@ -1380,26 +1437,57 @@ def extract_key_info_pass(items, cap=None, deadline_sec=None, bizinfo_ok=True, c
             return False
         return True
 
-    cands = [it for it in items
-             if bizinfo_ok and 'bizinfo.go.kr' in (it.get('링크') or '')
-             and _needs_attach(it) and _ext_allows(it)]
-    cands.sort(key=lambda it: 0 if not it.get('_ext') else 1)  # 신규 우선
+    # 후보 필터: KEYINFO_ATTACH_SOURCES 도메인 allowlist 기반.
+    # bizinfo는 보존 모드(bizinfo_ok=False)일 때만 제외 — TP 보강은 비즈인포
+    # 차단일에도 휴면하지 않는다.
+    picked = []
+    for it in items:
+        dom = _ki_domain(it.get('링크'))
+        if dom is None:
+            continue
+        if KEYINFO_ATTACH_SOURCES[dom].get('flag') == 'bizinfo_ok' and not bizinfo_ok:
+            continue
+        if _needs_attach(it) and _ext_allows(it):
+            picked.append((dom, it))
+    picked.sort(key=lambda pair: 0 if not pair[1].get('_ext') else 1)  # 신규 우선
+    # 도메인별 그룹화(도메인별 run당 상한) 후 라운드로빈 인터리브 —
+    # 한 도메인 장애·대량 후보가 cap(200)·deadline(600s)을 독식하지 못하게 함.
+    groups = collections.defaultdict(list)
+    for dom, it in picked:
+        if len(groups[dom]) < KEYINFO_DOMAIN_CAP:
+            groups[dom].append((dom, it))
+    if groups:
+        dist = ', '.join(f"{d}:{len(v)}" for d, v in sorted(groups.items()))
+        print(f"[핵심정보] 첨부 후보 도메인 분포: {dist} "
+              f"(도메인별 상한 {KEYINFO_DOMAIN_CAP}, 전체 cap {cap})")
+    cands = [p for tup in itertools.zip_longest(*groups.values()) for p in tup
+             if p is not None] if groups else []
     cands = cands[:max(0, cap)]
     t0 = time.monotonic()
     stats = {'ok': 0, 'none': 0, 'fail': 0, 'skip': 0}
-    state = {'consec_fail': 0, 'aborted': False}
+    # 도메인별 실패 격리 상태 + 통계 (전역 consec_fail은 한 도메인 장애가
+    # 다른 도메인 잔여 후보까지 abort시키는 결함이 있었음)
+    state = collections.defaultdict(
+        lambda: {'consec': 0, 'fail': 0, 'done': 0, 'aborted': False})
+    dom_stats = collections.defaultdict(lambda: {'ok': 0, 'none': 0, 'fail': 0})
 
-    def _one(it):
-        if state['aborted'] or time.monotonic() - t0 > deadline_sec:
+    def _one(pair):
+        dom, it = pair
+        st = state[dom]
+        if st['aborted'] or time.monotonic() - t0 > deadline_sec:
             stats['skip'] += 1
             return
         link = it.get('링크') or ''
+        cfg = KEYINFO_ATTACH_SOURCES.get(dom, {})
         try:
             html = fetch_html(link, timeout=15)
             soup = BeautifulSoup(html, 'html.parser')
+            base_url = f"https://{urlparse(link).netloc}"
             _fn, txt = _fetch_best_attachment_text(
-                soup, html, link, base_url='https://www.bizinfo.go.kr',
-                ctx={}, max_files=2, max_pdf_pages=10)
+                soup, html, link, base_url=base_url,
+                ctx={'attachment_resolver': cfg.get('resolver'),
+                     'session': cfg.get('session')},
+                max_files=2, max_pdf_pages=10)
             n = int((it.get('_ext') or {}).get('n') or 0) + 1
             if txt:
                 f = extract_key_fields(txt, source_kind='attach')
@@ -1409,21 +1497,27 @@ def extract_key_info_pass(items, cap=None, deadline_sec=None, bizinfo_ok=True, c
                     it['핵심정보'] = merged
                     it['_ext'] = {'v': KEYINFO_VERSION, 'st': 'ok', 'n': n, 'at': today_str}
                     stats['ok'] += 1
+                    dom_stats[dom]['ok'] += 1
                 else:
                     it['_ext'] = {'v': KEYINFO_VERSION, 'st': 'none', 'n': n, 'at': today_str}
                     stats['none'] += 1
+                    dom_stats[dom]['none'] += 1
             else:
                 it['_ext'] = {'v': KEYINFO_VERSION, 'st': 'none', 'n': n, 'at': today_str}
                 stats['none'] += 1
-            state['consec_fail'] = 0
+                dom_stats[dom]['none'] += 1
+            st['consec'] = 0
+            st['done'] += 1
         except Exception:
             stats['fail'] += 1
-            state['consec_fail'] += 1
+            dom_stats[dom]['fail'] += 1
+            st['fail'] += 1
+            st['done'] += 1
+            st['consec'] += 1
             n_prev = int((it.get('_ext') or {}).get('n') or 0)
             it['_ext'] = {'v': KEYINFO_VERSION, 'st': 'fail', 'n': n_prev + 1, 'at': today_str}
-            done = stats['ok'] + stats['none'] + stats['fail']
-            if state['consec_fail'] >= 8 or (done >= 10 and stats['fail'] / done > 0.5):
-                state['aborted'] = True  # 도메인 장애 격리 — 잔여 항목 _ext 미갱신
+            if st['consec'] >= 8 or (st['done'] >= 10 and st['fail'] / st['done'] > 0.5):
+                st['aborted'] = True  # 해당 도메인만 격리 — 잔여 항목 _ext 미갱신
         finally:
             time.sleep(0.5)
 
@@ -1432,10 +1526,16 @@ def extract_key_info_pass(items, cap=None, deadline_sec=None, bizinfo_ok=True, c
         with ThreadPoolExecutor(max_workers=EXTRACT_WORKERS) as pool:
             list(pool.map(_one, cands))
     total_ki = sum(1 for it in items if it.get('핵심정보'))
+    any_aborted = any(st['aborted'] for st in state.values())
     print(f"[핵심정보] 개요 마이닝 {mined}건 / 첨부 ok {stats['ok']}·none {stats['none']}"
           f"·fail {stats['fail']}·skip {stats['skip']}"
-          f"{' (도메인 장애로 중단)' if state['aborted'] else ''}"
+          f"{' (일부 도메인 장애로 중단)' if any_aborted else ''}"
           f" / 총 보유 {total_ki}/{len(items)}건")
+    if dom_stats:
+        parts = [f"{d} ok {s['ok']}/none {s['none']}/fail {s['fail']}"
+                 + (' [중단]' if state[d]['aborted'] else '')
+                 for d, s in sorted(dom_stats.items())]
+        print(f"[핵심정보] 도메인별: {' | '.join(parts)}")
 
 
 def backfill_key_info(cap=2000):
@@ -3659,16 +3759,27 @@ def crawl_gbtp_list(end_page=3):
                 link_tag = title_td.find('a')
                 
                 link = ""
-                # Extract nttId from onclick="javascript:fn_detail('10633','2')"
+                # Extract nttNo/rnum from onclick="javascript:fn_detail('10633','2')"
+                # 사이트가 상세 진입을 /user/boardDetail.do로 개편(2026-07) — 구
+                # board/view.do?nttId= URL은 전원 404라 GET boardDetail.do 형식으로
+                # 생성 (GET 200·CSRF 불요 실측, 사용자 노출 링크도 살아있는 URL).
                 if link_tag and 'onclick' in link_tag.attrs:
                     onclick = link_tag['onclick']
-                    # Pattern: fn_detail('nttId','pageIndex')
-                    match = re.search(r"fn_detail\('([^']+)'", onclick)
+                    # Pattern: fn_detail('nttNo','rnum')
+                    match = re.search(r"fn_detail\('([^']+)','(\d+)'\)", onclick)
                     if match:
-                        nttId = match.group(1)
-                        link = f"https://www.gbtp.or.kr/user/board/view.do?bbsId=BBSMSTR_000000000021&nttId={nttId}&pageIndex={page}"
+                        link = (f"https://www.gbtp.or.kr/user/boardDetail.do"
+                                f"?bbsId=BBSMSTR_000000000021&nttNo={match.group(1)}"
+                                f"&rnum={match.group(2)}&pageIndex={page}")
                     else:
-                        link = url # Fallback
+                        # rnum 미포착 시 nttNo만으로 폴백
+                        match = re.search(r"fn_detail\('([^']+)'", onclick)
+                        if match:
+                            link = (f"https://www.gbtp.or.kr/user/boardDetail.do"
+                                    f"?bbsId=BBSMSTR_000000000021&nttNo={match.group(1)}"
+                                    f"&pageIndex={page}")
+                        else:
+                            link = url # Fallback
                 
                 # Col 3: Date (접수기간) e.g., 2025-11-25~2026-01-07
                 date_td = cols[3]
