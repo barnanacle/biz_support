@@ -1896,6 +1896,96 @@ def _crawl_bizinfo_via_api():
     return out
 
 
+# ── K-Startup(창업지원포털) 무키 OpenAPI ─────────────────────────────
+# 창업진흥원 운영. nidapi.k-startup.go.kr은 비즈인포와 별도 인프라라 Actions IP
+# 차단과 무관 — 비즈인포 차단 기간에도 '창업' 분야 신규 유입을 보충한다. 지원대상·
+# 문의처·신청방법이 목록 응답에 내장돼 첨부/상세 fetch 없이 핵심정보까지 완성된다.
+KSTARTUP_API_URL = 'https://nidapi.k-startup.go.kr/api/kisedKstartupService/v1/getAnnouncementInformation'
+_KSTARTUP_CH_MAP = (
+    ('온라인', 'aply_mthd_onli_rcpt_istc'), ('이메일', 'aply_mthd_eml_rcpt_istc'),
+    ('방문', 'aply_mthd_vst_rcpt_istc'), ('우편', 'aply_mthd_pssr_rcpt_istc'),
+    ('팩스', 'aply_mthd_fax_rcpt_istc'),
+)
+
+
+def _fmt_phone(s):
+    """무하이픈 전화번호에 하이픈 삽입. '0424710902'→'042-471-0902', 서울 02는 2자리 국번."""
+    s = re.sub(r'\D', '', s or '')
+    if len(s) < 9:
+        return ''
+    if s.startswith('02'):
+        return f'{s[:2]}-{s[2:-4]}-{s[-4:]}'
+    return f'{s[:3]}-{s[3:-4]}-{s[-4:]}'
+
+
+def crawl_kstartup_list():
+    """K-Startup 모집중(rcrt_prgs_yn=Y) 공고를 무키 OpenAPI로 수집.
+    핵심정보(지원대상·문의처·신청방법)는 API 내장 필드에서 직접 구성 — 첨부 불필요.
+    """
+    print("K-Startup(창업지원포털) OpenAPI 수집 시작...")
+    items = []
+    today = datetime.now().date()
+    try:
+        page = 1
+        while page <= 20:  # perPage 100 × 20 = 2000 안전 상한
+            r = GLOBAL_SESSION.get(
+                KSTARTUP_API_URL, timeout=30, verify=False,
+                params={'page': page, 'perPage': 100, 'returnType': 'json',
+                        'cond[rcrt_prgs_yn::EQ]': 'Y'})
+            r.raise_for_status()
+            d = r.json()
+            data = d.get('data') or []
+            if not data:
+                break
+            for it in data:
+                title = (it.get('biz_pbanc_nm') or '').strip()
+                url = (it.get('detl_pg_url') or '').strip()
+                if not title or not url:
+                    continue
+                bgng = _fmt_ymd8(str(it.get('pbanc_rcpt_bgng_dt') or ''))
+                end = _fmt_ymd8(str(it.get('pbanc_rcpt_end_dt') or ''))
+                try:
+                    if end and datetime.strptime(end, '%Y-%m-%d').date() < today:
+                        continue  # 방어적 마감 필터
+                except ValueError:
+                    pass
+                overview = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ',
+                                  str(it.get('pbanc_ctnt') or ''))).strip()
+                ki = {}
+                tgt = re.sub(r'\s+', ' ', str(it.get('aply_trgt_ctnt') or '')).strip()
+                if len(tgt) >= 8:
+                    ki['지원대상'] = _ki_cap(tgt, 150)
+                phone = _fmt_phone(it.get('prch_cnpl_no'))
+                if phone:
+                    dept = (it.get('biz_prch_dprt_nm') or '').strip()
+                    ki['문의처'] = _ki_cap((dept + ' ' + phone).strip(), 100)
+                channels = [name for name, key in _KSTARTUP_CH_MAP if (it.get(key) or '').strip()]
+                if channels:
+                    ki['신청방법'] = '/'.join(channels)
+                item = {
+                    '지원사업명': title,
+                    '신청기간': f'{bgng} ~ {end}' if bgng and end else (bgng or end or '상시'),
+                    '링크': url,
+                    '사업개요': overview,
+                    '등록일자': bgng,  # 접수시작일 = recency 신호
+                    '출처': 'K-Startup',
+                }
+                if ki:
+                    item['핵심정보'] = ki
+                    item['_ext'] = {'v': KEYINFO_VERSION, 'st': 'api', 'n': 0,
+                                    'at': today.strftime('%Y-%m-%d')}
+                items.append(item)
+            if page * 100 >= (d.get('matchCount') or 0):
+                break
+            page += 1
+            time.sleep(0.4)
+    except Exception as e:
+        print(f"[K-Startup] 수집 실패 → 빈 결과: {e}")
+        return []
+    print(f"[K-Startup] 모집중 {len(items)}건 수집 (핵심정보 내장)")
+    return items
+
+
 def crawl_bizinfo_list(driver=None):
     """비즈인포(기업마당) 전체 공고를 엑셀 일괄 다운로드로 수집.
 
@@ -4635,6 +4725,15 @@ def main():
                 final_results.extend(preserved)
     except Exception as e:
         print(f"[오류] 소상공인24 크롤링 실패: {e}")
+
+    # 21. K-Startup (창업지원포털) — 무키 OpenAPI. 비즈인포 차단과 무관한 별도
+    #     인프라라 차단 기간에도 창업 분야 신규 유입을 보충한다.
+    try:
+        kstartup_list = crawl_kstartup_list()
+        if kstartup_list:
+            final_results.extend(kstartup_list)
+    except Exception as e:
+        print(f"[오류] K-Startup 크롤링 실패: {e}")
 
     # ── 결과 저장 ──────────────────────────────────────────
     print("\n" + "=" * 60)

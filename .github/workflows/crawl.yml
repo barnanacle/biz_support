@@ -67,6 +67,7 @@ jobs:
           fi
           echo "probe sbiz24(api): $(curl -sS -o /dev/null -w '%{http_code}' -m 20 -X POST -H 'Content-Type: application/json' -H 'Origin-Method: GET' --data '{"sortModel":[],"search":{"pbancNm":""},"paging":true,"startRow":0,"endRow":1}' 'https://www.sbiz24.kr/api/combinePbanc/list' || echo 'FAIL')" || true
           echo "probe bizinfo(직접): $(curl -sS -o /dev/null -w '%{http_code}' -m 20 'https://www.bizinfo.go.kr/uss/rss/bizinfoApi.do' || echo 'FAIL')" || true
+          echo "probe kstartup(api): $(curl -sS -o /dev/null -w '%{http_code}' -m 20 'https://nidapi.k-startup.go.kr/api/kisedKstartupService/v1/getAnnouncementInformation?page=1&perPage=1&returnType=json' || echo 'FAIL')" || true
 
       - name: 크롤링 실행
         env:
