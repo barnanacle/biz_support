@@ -222,7 +222,35 @@ class DESAdapter(requests.adapters.HTTPAdapter):
 # 설정
 START_PAGE = 1
 END_PAGE = 10          # jiwon 계열 크롤러 기본 페이지 수
-SBIZ24_END_PAGE = 85   # 소상공인24 크롤링 페이지 수
+
+# ── P2: 소상공인24 JSON API 설정 ─────────────────────────────────────────
+# 기존 Selenium 85페이지 순회는 SPA(Vue)가 해시 URL ?page= 를 무시해 구조적으로
+# 최대 10건(1페이지)만 수집됐고, WebDriverWait 렌더 레이스로 0↔10건 교차 발생.
+# 실증된 JSON API(POST /api/combinePbanc/list) 직접 호출로 신청가능 전수 수집.
+SBIZ24_API_URL = 'https://www.sbiz24.kr/api/combinePbanc/list'
+SBIZ24_API_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+    'Accept': 'application/json',
+    'Content-Type': 'application/json',
+    'Referer': 'https://www.sbiz24.kr/',
+    'Origin': 'https://www.sbiz24.kr',
+    'Origin-Method': 'GET',  # 필수: 없으면 500, 있으면 쿠키·세션 없이 200 (2026-07-06 실측)
+}
+# 축C 실증 페이로드 그대로 — 필터 없는 전체 목록 검색 조건
+SBIZ24_SEARCH_BODY = {
+    "pbancNm": "", "rcrtTypeCdList": [], "rcrtTypeCdNmList": [],
+    "rcrtTypeCdNmListDisplay": "", "regionNmList": [], "regionNmListDisplay": "",
+    "departNmList": [], "departNmListDisplay": "", "tpbizCdList": [],
+    "tpbizCdListDisplay": "", "bhis": {"from": None, "to": None},
+    "wrkr": {"from": None, "to": None}, "sls": {"from": None, "to": None},
+    "aplySeYn": "N", "sbrPbancYn": "N", "itrstPbancYn": "N", "bizType": None,
+    "searchBox": None, "ptPbancSortBy": None, "regionCdList": [],
+}
+SBIZ24_WINDOW = 300  # 윈도우 페이징 폭 (0-300 단일 호출 성공 실측)
+# 상세(Selenium) 크롤링 run당 상한 — 첫 run 수백 건 폭주 시 러너 시간·상대 서버
+# 부하 방지. 잔여분은 다음 run에서 자연 백필.
+SBIZ24_DETAIL_CAP = int(os.environ.get('SBIZ24_DETAIL_CAP', '150'))
 
 # ── 비즈인포(기업마당) 신 시스템(selectSIIA200) 대응 설정 ─────────────────
 # 2026년 기업마당이 구 게시판(/web/lay1/bbs/S1T122C128)에서 신 시스템으로 전환.
@@ -1632,6 +1660,32 @@ def _load_prev_bizinfo_items():
         preserved.append(p)
     print(f"[비즈인포] 이전 데이터 보존: {len(preserved)}건 (마감 제외 {dropped}건)")
     return preserved
+
+
+def _load_prev_sbiz24_items():
+    """이전 data.json의 소상공인24 항목을 링크→항목 dict로 로드.
+
+    용도 (main의 sbiz24 블록):
+      1) 상세 증분화 — 사업개요가 유효한 링크는 재크롤링 없이 copy-forward,
+         신규 링크만 Selenium 상세 크롤링 (SBIZ24_DETAIL_CAP 상한).
+      2) 보존 폴백 — API 수집 0건(스키마·Origin-Method 게이트 변경 등) 시
+         미마감분 carry-forward (비즈인포 보존 로직과 동일 패턴).
+    """
+    web_data_path = os.path.join(os.path.dirname(__file__), 'biz_support_web', 'data.json')
+    out = {}
+    try:
+        with open(web_data_path, 'r', encoding='utf-8') as f:
+            prev = json.load(f).get('data', [])
+    except (FileNotFoundError, json.JSONDecodeError):
+        return out
+    for it in prev:
+        if it.get('출처') != '소상공인24':
+            continue
+        link = (it.get('링크') or '').strip()
+        if not link:
+            continue
+        out[link] = it
+    return out
 
 
 def _bizinfo_excel_bytes():
@@ -4051,85 +4105,59 @@ def _close_sbiz24_thread_driver():
             pass
         _sbiz24_thread_local.driver = None
 
-def crawl_sbiz24_list(end_page=SBIZ24_END_PAGE):
+def crawl_sbiz24_list(max_items=2000):
     """
-    소상공인24(sbiz24.kr) 목록 크롤링
-    URL: https://www.sbiz24.kr/#/combinePbancList?page={page}
-    필터: 상태 == '신청가능'
+    소상공인24(sbiz24.kr) 목록 크롤링 — JSON API 직접 호출 (Selenium 불필요)
+
+    POST /api/combinePbanc/list 를 startRow/endRow 윈도우 페이징으로 순회.
+    필터: aplyPsbltySe == '신청가능' (기존 테이블 status 컬럼과 동일 값)
+    링크: pbancGubun 'B'(유관기관)+pbancId → #/extldPbanc/{pbancId},
+          그 외 pbancSn → #/pbanc/{pbancSn} (렌더된 anchor href 대조로 확정)
+    dedupe: 링크 문자열 기준 — pbancSn은 gubun 간 비유일 + 윈도우 간 overlap 관측.
     출력: 공통 스키마 (지원사업명, 신청기간, 사업개요, 링크, 출처)
+    API 실패 시 부분 수집이라도 반환 — 0건이면 main()이 이전 데이터를 보존.
     """
-    print(f"\n[소상공인24] 1~{end_page}페이지 목록 크롤링 시작 (SPA/Vue.js)...")
-    driver = setup_driver()
-    all_data = []
-    seen_links = set()  # 중복 방지: 이미 수집한 링크 추적
-
-    try:
-        for page in range(1, end_page + 1):
-            url = f"https://www.sbiz24.kr/#/combinePbancList?page={page}"
-            print(f"  [소상공인24] 페이지 {page} 크롤링 중: {url}")
-
-            try:
-                driver.get(url)
-                WebDriverWait(driver, 8).until(
-                    EC.presence_of_element_located((By.TAG_NAME, "table"))
-                )
-                time.sleep(0.3)
-
-                tables = driver.find_elements(By.TAG_NAME, "table")
-                if not tables:
-                    print(f"  페이지 {page}: 테이블 없음")
-                    break
-
-                rows = tables[0].find_elements(By.TAG_NAME, "tr")
-                page_items = 0
-                page_new_items = 0
-
-                for row in rows:
-                    cols = row.find_elements(By.TAG_NAME, "td")
-                    if len(cols) >= 7:
-                        status = cols[6].text.strip()
-                        if status == "신청가능":
-                            title_col = cols[2]
-                            title = title_col.text.strip()
-                            try:
-                                link_el = title_col.find_element(By.TAG_NAME, "a")
-                                link = link_el.get_attribute("href") or "N/A"
-                            except:
-                                link = "N/A"
-                            period = cols[4].text.strip()
-                            page_items += 1
-
-                            # 이미 수집한 링크면 건너뜀
-                            if link in seen_links:
-                                continue
-                            seen_links.add(link)
-                            page_new_items += 1
-
-                            all_data.append({
-                                '출처': '소상공인24',
-                                '지원사업명': title,
-                                '신청기간': period,
-                                '링크': link,
-                                '사업개요': ''  # 상세 크롤링 전 빈 값
-                            })
-
-                print(f"  페이지 {page}: {page_items}개 '신청가능' 항목 중 {page_new_items}개 신규 수집")
-
-                # 페이지에서 신규 항목이 하나도 없으면 사이트가 더 이상 새 페이지를 제공하지 않는 것 → 조기 종료
-                if page > 1 and page_new_items == 0:
-                    print(f"  [소상공인24] 페이지 {page}에서 신규 항목 없음 → 크롤링 종료")
-                    break
-
-            except Exception as e:
-                print(f"  [오류] 페이지 {page} 처리 중: {e}")
-
-    finally:
+    print("\n[소상공인24] JSON API 목록 수집 시작...")
+    all_data, seen_links = [], set()
+    start, total = 0, None
+    while total is None or start < min(total, max_items):
+        body = {"sortModel": [], "search": SBIZ24_SEARCH_BODY, "paging": True,
+                "startRow": start, "endRow": start + SBIZ24_WINDOW}
         try:
-            driver.quit()
-        except:
-            pass
-
-    print(f"[소상공인24] 목록 크롤링 완료. 총 {len(all_data)}개 항목 (고유)")
+            r = requests.post(SBIZ24_API_URL, json=body, headers=SBIZ24_API_HEADERS,
+                              timeout=20, verify=False)
+            r.raise_for_status()
+            # 응답 형태 검증 — 스키마 변경 시 로그 후 break (부분 수집 반환)
+            dflt = r.json()['data']['default']
+        except Exception as e:
+            print(f"  [소상공인24] API 호출 실패(startRow={start}): {e}")
+            break
+        total = dflt.get('total', 0)
+        items = dflt.get('list', [])
+        if not items:
+            break
+        for it in items:
+            if it.get('aplyPsbltySe') != '신청가능':
+                continue
+            if it.get('pbancGubun') == 'B' and it.get('pbancId'):
+                link = f"https://www.sbiz24.kr/#/extldPbanc/{it['pbancId']}"
+            elif it.get('pbancSn'):
+                link = f"https://www.sbiz24.kr/#/pbanc/{it['pbancSn']}"
+            else:
+                continue
+            if link in seen_links:  # pbancSn은 gubun 간 비유일 → 링크로 dedupe
+                continue
+            seen_links.add(link)
+            all_data.append({
+                '출처': '소상공인24',
+                '지원사업명': (it.get('pbancNm') or '').strip(),
+                '신청기간': (it.get('aplyPd') or '').strip(),
+                '링크': link,
+                '사업개요': '',  # 상세 크롤링/copy-forward 전 빈 값
+            })
+        start += SBIZ24_WINDOW
+        time.sleep(0.8)  # 예의 간격
+    print(f"[소상공인24] 목록 수집 완료: 신청가능 {len(all_data)}건 / 전체 {total}건")
     return all_data
 
 def _crawl_single_sbiz24_detail(item, index, total):
@@ -4438,12 +4466,51 @@ def main():
     except:
         pass
 
-    # 20. 소상공인24 (sbiz24.kr) - 별도 드라이버 사용
+    # 20. 소상공인24 (sbiz24.kr) — JSON API 목록 + 상세 증분화 (Selenium은 신규분만)
     try:
-        sbiz24_list = crawl_sbiz24_list(end_page=SBIZ24_END_PAGE)
+        sbiz24_list = crawl_sbiz24_list()
+        prev_sbiz24 = _load_prev_sbiz24_items()
         if sbiz24_list:
-            sbiz24_details = crawl_sbiz24_details(sbiz24_list)
-            final_results.extend(sbiz24_details)
+            # 상세 증분화: 이전 run에서 사업개요를 확보한 링크는 copy-forward
+            # (핵심정보/_ext 존재 시 함께), 신규 링크만 Selenium 상세 크롤링.
+            # API 응답 순서(최신 등록순 관측)를 유지한 채 SBIZ24_DETAIL_CAP건만
+            # 투입 — 첫 run 수백 건 폭주 방지, 잔여분은 다음 run에서 자연 백필.
+            _bad_summaries = ('', '내용 추출 실패', '크롤링 오류', '링크 없음')
+            need_detail = []
+            for it in sbiz24_list:
+                p = prev_sbiz24.get(it['링크'])
+                if p and (p.get('사업개요') or '').strip() not in _bad_summaries:
+                    it['사업개요'] = p['사업개요']
+                    if p.get('핵심정보') and not it.get('핵심정보'):
+                        it['핵심정보'] = p['핵심정보']
+                    if p.get('_ext') and not it.get('_ext'):
+                        it['_ext'] = p['_ext']
+                else:
+                    need_detail.append(it)
+            capped = need_detail[:SBIZ24_DETAIL_CAP]
+            print(f"[소상공인24] 사업개요 copy-forward {len(sbiz24_list) - len(need_detail)}건 / "
+                  f"신규 상세 대상 {len(need_detail)}건 중 {len(capped)}건 크롤링 "
+                  f"(cap={SBIZ24_DETAIL_CAP})")
+            if capped:
+                crawl_sbiz24_details(capped)  # item dict in-place 수정 (사업개요 채움)
+            final_results.extend(sbiz24_list)
+        else:
+            # 보존 폴백: 수집 0건이면(스키마 변경·Origin-Method 게이트 변경 등)
+            # 이전 항목 중 미마감분 carry-forward — 서비스 데이터 무손상 보장.
+            today = datetime.now().date()
+            preserved = []
+            for link, it in prev_sbiz24.items():
+                end_str = str(it.get('신청기간', '')).split('~')[-1].strip()[:10]
+                try:
+                    if datetime.strptime(end_str, '%Y-%m-%d').date() < today:
+                        continue
+                except Exception:
+                    pass  # 파싱 실패 시 보존 (보수적)
+                preserved.append(it)
+            if preserved:
+                print(f"[소상공인24] ⚠ 수집 0건 → 이전 데이터 {len(preserved)}건 보존 "
+                      f"(API 스키마/게이트 변경 의심 — 로그 확인 필요)")
+                final_results.extend(preserved)
     except Exception as e:
         print(f"[오류] 소상공인24 크롤링 실패: {e}")
 
