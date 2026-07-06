@@ -1810,6 +1810,15 @@ def _bizinfo_excel_bytes():
         return content
 
 
+def _fmt_ymd8(s):
+    """'YYYYMMDD' 또는 'YYYYMMDD HH:MM' 앞 8자 → 'YYYY-MM-DD'. 비정형은 앞 10자 유지."""
+    s = (s or '').strip()
+    head = s[:8]
+    if len(head) == 8 and head.isdigit():
+        return f'{head[:4]}-{head[4:6]}-{head[6:8]}'
+    return s[:10]
+
+
 def _crawl_bizinfo_via_api():
     """엑셀(직접+릴레이) 실패 시 3차 폴백: 기업마당 JSON API → 기존 스키마 매핑.
 
@@ -1877,7 +1886,9 @@ def _crawl_bizinfo_via_api():
                 '링크': link,  # 절대 www.bizinfo.go.kr URL → first_seen·dedupe·캐시 키 호환
                 '사업개요': re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ',
                                                    str(it.get('bsnsSumryCn') or ''))).strip(),
-                '등록일자': str(it.get('creatPnttm') or '')[:10],
+                # creatPnttm은 'YYYYMMDD' 또는 'YYYYMMDD HH:MM' — 앞 8자만 취해
+                # 엑셀 경로와 동일한 'YYYY-MM-DD'로 정규화(잘림 artifact 방지).
+                '등록일자': _fmt_ymd8(str(it.get('creatPnttm') or '')),
                 '출처': '비즈인포',  # 즉시 태깅 — main()이 enrich를 생략
             })
         time.sleep(0.6)
