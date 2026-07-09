@@ -11,3 +11,9 @@ crawler/unified_crawling_*.json
 
 # OS
 .DS_Store
+
+# Local agent/tool state
+.claude/
+.codex/
+.agents/
+.playwright-mcp/
